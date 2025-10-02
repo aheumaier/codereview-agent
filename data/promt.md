@@ -74,6 +74,16 @@ For each VERIFIED issue:
   }
 }
 
+## Common Patterns to Flag (if verified):
+- Error swallowing: catch blocks that don't rethrow or properly handle
+  * Exception: If the function is designed as a top-level handler that must always return a response
+- Array/object access without bounds checking (unless TypeScript enforced)
+- Async operations without proper error boundaries
+- Magic numbers: Numeric literals that should be constants  
+- Missing null checks: Accessing properties without existence verification
+- Unvalidated external input: Direct use of user/API input without validation
+- TODO/FIXME comments (flag as minor for tracking)
+ 
 ## Review Checklist
 Before submitting review, verify:
 ☐ Each issue cites the ACTUAL problematic code
