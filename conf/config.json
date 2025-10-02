@@ -1,0 +1,45 @@
+{
+  "review": {
+    "maxDaysBack": 30,
+    "prStates": ["open"],
+    "excludeLabels": ["wip", "draft", "do-not-review"],
+    "maxFilesPerPR": 50,
+    "maxLinesPerFile": 1000,
+    "contextLines": 10,
+    "minCoveragePercent": 80,
+    "maxComplexity": 10
+  },
+  "platforms": {
+    "gitlab": {
+      "enabled": true,
+      "url": "${GITLAB_API_URL}",
+      "token": "${GITLAB_PERSONAL_ACCESS_TOKEN}",
+      "projectId": "${GITLAB_PROJECT_ID}"
+    },
+    "github": {
+      "enabled": false,
+      "token": "${GITHUB_TOKEN}"
+    },
+    "bitbucket": {
+      "enabled": false,
+      "username": "${BITBUCKET_USERNAME}",
+      "appPassword": "${BITBUCKET_APP_PASSWORD}"
+    }
+  },
+  "claude": {
+    "apiKey": "${CLAUDE_API_KEY}",
+    "model": "claude-3-opus-20240229",
+    "maxTokens": 4096,
+    "temperature": 0.3
+  },
+  "output": {
+    "dryRun": "${DRY_RUN}",
+    "postComments": true,
+    "postSummary": true,
+    "approveIfNoIssues": false
+  },
+  "tracking": {
+    "dbPath": "./data/reviews.db",
+    "ttlDays": 30
+  }
+}

@@ -1,0 +1,319 @@
+/**
+ * Retry utility with exponential backoff
+ * Following SOLID principles and Clean Code practices
+ */
+
+import { PlatformError, MCPError } from './errorHelpers.js';
+
+/**
+ * Default retry configuration
+ * Single Responsibility: Configuration management
+ */
+const DEFAULT_RETRY_CONFIG = {
+  maxRetries: 3,
+  initialDelay: 1000,
+  maxDelay: 32000,
+  backoffMultiplier: 2,
+  jitterFactor: 0.2
+};
+
+/**
+ * Network error codes that should be retried
+ */
+const RETRYABLE_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'ECONNREFUSED',
+  'EPIPE',
+  'EHOSTUNREACH',
+  'EAI_AGAIN',
+  'ENETUNREACH',
+  'ECONNABORTED'
+]);
+
+/**
+ * HTTP status codes that should be retried
+ */
+const RETRYABLE_HTTP_STATUSES = new Set([
+  408, // Request Timeout
+  429, // Too Many Requests
+  500, // Internal Server Error
+  502, // Bad Gateway
+  503, // Service Unavailable
+  504, // Gateway Timeout
+  509, // Bandwidth Limit Exceeded
+  520, // Unknown Error (Cloudflare)
+  521, // Web Server Is Down (Cloudflare)
+  522, // Connection Timed Out (Cloudflare)
+  523, // Origin Is Unreachable (Cloudflare)
+  524, // A Timeout Occurred (Cloudflare)
+  525, // SSL Handshake Failed (Cloudflare)
+  527, // Railgun Error (Cloudflare)
+  529  // Site is overloaded
+]);
+
+/**
+ * Determine if an error is retryable
+ * @param {Error} error - Error to check
+ * @returns {boolean} True if error should be retried
+ */
+export function isRetryableError(error) {
+  if (!error) return false;
+
+  // Check network error codes
+  if (error.code && RETRYABLE_ERROR_CODES.has(error.code)) {
+    return true;
+  }
+
+  // Check HTTP status codes
+  if (error.statusCode && RETRYABLE_HTTP_STATUSES.has(error.statusCode)) {
+    return true;
+  }
+
+  // Check PlatformError status codes
+  if (error instanceof PlatformError && error.statusCode) {
+    return RETRYABLE_HTTP_STATUSES.has(error.statusCode);
+  }
+
+  // Check MCPError - usually network-related
+  if (error instanceof MCPError) {
+    // Check if the underlying cause is retryable
+    if (error.cause) {
+      return isRetryableError(error.cause);
+    }
+    // MCPErrors without a cause might be transient
+    return true;
+  }
+
+  // Check for fetch Response errors
+  if (error.response?.status) {
+    return RETRYABLE_HTTP_STATUSES.has(error.response.status);
+  }
+
+  // Check error message for common retryable patterns
+  const errorMessage = error.message?.toLowerCase() || '';
+  const retryablePatterns = [
+    'timeout',
+    'timed out',
+    'network',
+    'econnreset',
+    'socket hang up',
+    'rate limit',
+    'too many requests',
+    'service unavailable',
+    'gateway',
+    'overloaded'
+  ];
+
+  return retryablePatterns.some(pattern => errorMessage.includes(pattern));
+}
+
+/**
+ * Calculate exponential backoff delay with jitter
+ * @param {number} attempt - Current attempt number (0-based)
+ * @param {Object} options - Retry options
+ * @returns {number} Delay in milliseconds
+ */
+export function calculateDelay(attempt, options = {}) {
+  const config = { ...DEFAULT_RETRY_CONFIG, ...options };
+
+  // Calculate base exponential delay
+  const baseDelay = Math.min(
+    config.initialDelay * Math.pow(config.backoffMultiplier, attempt),
+    config.maxDelay
+  );
+
+  // Add jitter (±20% by default) to prevent thundering herd
+  const jitter = baseDelay * config.jitterFactor;
+  const randomJitter = (Math.random() - 0.5) * 2 * jitter;
+
+  return Math.round(Math.max(0, baseDelay + randomJitter));
+}
+
+/**
+ * Sleep for specified milliseconds
+ * @param {number} ms - Milliseconds to sleep
+ * @returns {Promise<void>} Promise that resolves after delay
+ */
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Retry an async function with exponential backoff
+ * @param {Function} fn - Async function to retry
+ * @param {Object} options - Retry configuration options
+ * @returns {Promise<any>} Result of successful function call
+ * @throws {Error} Last error if all retries exhausted
+ */
+export async function retryWithBackoff(fn, options = {}) {
+  const config = { ...DEFAULT_RETRY_CONFIG, ...options };
+
+  // Validate inputs
+  if (typeof fn !== 'function') {
+    throw new TypeError('First argument must be a function');
+  }
+
+  if (config.maxRetries < 0) {
+    throw new RangeError('maxRetries must be non-negative');
+  }
+
+  let lastError;
+
+  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
+    try {
+      // Execute the function
+      const result = await fn();
+
+      // Success - return result
+      return result;
+
+    } catch (error) {
+      lastError = error;
+
+      // Check if this is the last attempt
+      if (attempt === config.maxRetries) {
+        // Exhausted all retries
+        break;
+      }
+
+      // Check if error is retryable
+      const shouldRetry = config.shouldRetry
+        ? config.shouldRetry(error)
+        : isRetryableError(error);
+
+      if (!shouldRetry) {
+        // Error is not retryable, fail immediately
+        throw error;
+      }
+
+      // Calculate delay with exponential backoff and jitter
+      const delay = calculateDelay(attempt, config);
+
+      // Call onRetry callback if provided
+      if (config.onRetry) {
+        config.onRetry(error, attempt + 1, delay);
+      }
+
+      // Wait before next attempt
+      await sleep(delay);
+    }
+  }
+
+  // All retries exhausted, throw last error
+  throw lastError;
+}
+
+/**
+ * Circuit breaker implementation to prevent cascading failures
+ * Optional enhancement - tracks failure rates and opens circuit when threshold exceeded
+ */
+export class CircuitBreaker {
+  constructor(options = {}) {
+    this.threshold = options.threshold || 0.5; // 50% failure rate
+    this.windowSize = options.windowSize || 10; // Track last 10 calls
+    this.cooldownPeriod = options.cooldownPeriod || 60000; // 60 seconds
+    this.state = 'closed'; // closed, open, half-open
+    this.failures = 0;
+    this.successes = 0;
+    this.lastFailureTime = null;
+    this.callHistory = [];
+  }
+
+  /**
+   * Execute function with circuit breaker protection
+   * @param {Function} fn - Function to execute
+   * @returns {Promise<any>} Function result
+   */
+  async execute(fn) {
+    // Check if circuit should be half-open
+    if (this.state === 'open') {
+      const timeSinceFailure = Date.now() - this.lastFailureTime;
+      if (timeSinceFailure >= this.cooldownPeriod) {
+        this.state = 'half-open';
+      } else {
+        throw new Error('Circuit breaker is open - service unavailable');
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.recordSuccess();
+      return result;
+    } catch (error) {
+      this.recordFailure();
+      throw error;
+    }
+  }
+
+  /**
+   * Record successful call
+   */
+  recordSuccess() {
+    this.callHistory.push(true);
+    if (this.callHistory.length > this.windowSize) {
+      this.callHistory.shift();
+    }
+
+    if (this.state === 'half-open') {
+      this.state = 'closed';
+      this.failures = 0;
+    }
+  }
+
+  /**
+   * Record failed call
+   */
+  recordFailure() {
+    this.callHistory.push(false);
+    if (this.callHistory.length > this.windowSize) {
+      this.callHistory.shift();
+    }
+
+    this.lastFailureTime = Date.now();
+
+    // Calculate failure rate
+    const failureCount = this.callHistory.filter(success => !success).length;
+    const failureRate = failureCount / this.callHistory.length;
+
+    if (failureRate >= this.threshold) {
+      this.state = 'open';
+    }
+  }
+
+  /**
+   * Get current circuit breaker state
+   * @returns {string} Current state
+   */
+  getState() {
+    return this.state;
+  }
+
+  /**
+   * Reset circuit breaker to initial state
+   */
+  reset() {
+    this.state = 'closed';
+    this.failures = 0;
+    this.successes = 0;
+    this.lastFailureTime = null;
+    this.callHistory = [];
+  }
+}
+
+/**
+ * Create a wrapped function with built-in retry logic
+ * Factory pattern for creating retry-enabled functions
+ * @param {Function} fn - Function to wrap
+ * @param {Object} options - Retry options
+ * @returns {Function} Wrapped function with retry logic
+ */
+export function withRetry(fn, options = {}) {
+  return async function retryWrapper(...args) {
+    return retryWithBackoff(
+      async () => fn(...args),
+      options
+    );
+  };
+}
