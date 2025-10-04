@@ -108,6 +108,41 @@ The agent is configured via `conf/config.json`:
 }
 ```
 
+## Architecture
+
+The code review agent uses a 4-phase architecture with specialized sub-agents for comprehensive analysis:
+
+### Review Phases
+
+1. **Context Gathering**: Retrieve PR metadata, diffs, and repository context
+2. **Parallel Analysis**: Run specialized sub-agents concurrently
+   - Test Analysis Agent - Test coverage and quality analysis
+   - Security Analysis Agent - OWASP Top 10 vulnerability detection
+   - Performance Analysis Agent - Algorithmic complexity and performance
+   - Architecture Compliance Agent - SOLID principles and design patterns
+3. **Synthesis**: Aggregate findings, resolve conflicts, make decision
+4. **Platform Interaction**: Post comments and summary
+
+### Sub-Agents
+
+Sub-agents are defined in `.claude/agents/` using Claude Agent SDK patterns:
+
+- `test-analyzer.md` - Analyzes test coverage, quality, and missing test scenarios
+- `security-analyzer.md` - Detects security vulnerabilities per OWASP Top 10
+- `performance-analyzer.md` - Identifies algorithmic complexity and performance bottlenecks
+- `architecture-analyzer.md` - Validates SOLID principles and design patterns
+
+Each agent operates independently in parallel and returns structured findings in JSON format.
+
+### State Management
+
+Review state is persisted in `data/states/` for:
+- **Resilience**: Resume reviews on failure
+- **Re-review Detection**: Track reviewed PRs to avoid duplicates
+- **Audit Trail**: Maintain checkpoint history for debugging
+
+State transitions: `context_gathering → parallel_analysis → synthesis → output → complete`
+
 ## Review Process
 
 1. **Discovery**: Finds PRs from enabled platforms (last 7 days, open state)
@@ -127,6 +162,33 @@ The agent is configured via `conf/config.json`:
 - 🔴 **Critical**: Security vulnerabilities, data loss risks
 - 🟡 **Major**: Performance issues, missing tests, design problems
 - 🔵 **Minor**: Style issues, suggestions, improvements
+
+## Feature Flags
+
+Control feature rollout and experimentation via `conf/config.json`:
+
+```json
+{
+  "features": {
+    "useStateManagement": true,    // Enable state persistence
+    "useSubAgents": true,          // Use parallel sub-agents
+    "useDecisionMatrix": true,     // Use decision matrix for approvals
+    "legacyMode": false            // Fall back to single-agent mode
+  },
+  "rollout": {
+    "experimentalFeature": 50      // 50% gradual rollout
+  }
+}
+```
+
+### Rollout Mechanism
+
+Features in the `rollout` section use percentage-based gradual deployment:
+- `0%` = disabled for all PRs
+- `50%` = enabled for 50% of PRs (deterministic by PR ID)
+- `100%` = enabled for all PRs
+
+The rollout is deterministic - the same PR will always get the same feature state.
 
 ## Platform Support
 
@@ -172,6 +234,67 @@ CREATE TABLE reviews (
 );
 ```
 
+## Rollback Procedures
+
+### Emergency Rollback
+
+If issues arise with the new sub-agent architecture, follow these steps:
+
+1. **Disable new features immediately**:
+   ```json
+   // In conf/config.json
+   {
+     "features": {
+       "useSubAgents": false,
+       "useStateManagement": false,
+       "legacyMode": true
+     }
+   }
+   ```
+
+2. **Revert to previous stable version**:
+   ```bash
+   # Identify last stable commit
+   git log --oneline -10
+
+   # Revert recent changes (adjust number as needed)
+   git revert HEAD~3
+
+   # Reinstall dependencies
+   npm install
+
+   # Run tests to verify
+   npm test
+
+   # Restart agent
+   npm start
+   ```
+
+3. **Notify team** of rollback with reason and impact assessment
+
+### Data Recovery
+
+If state corruption occurs in `data/states/`:
+
+```bash
+# Backup corrupted states
+cp -r data/states data/states.backup.$(date +%Y%m%d-%H%M%S)
+
+# Clear state directory
+rm -rf data/states/*
+
+# Reviews will restart from scratch
+# Agent will rebuild state as it processes PRs
+```
+
+### Performance Degradation
+
+If sub-agents cause timeout issues:
+
+1. **Reduce parallelism**: Set `useSubAgents: false` in config
+2. **Check Claude API limits**: Monitor rate limiting responses
+3. **Review agent logs**: Check `logs/` for timeout patterns
+
 ## Testing
 
 ```bash
@@ -211,20 +334,81 @@ codereview-agent/
 
 ## Troubleshooting
 
-### No PRs Found
+### Common Issues
+
+#### No PRs Found
 - Check platform is enabled in config
 - Verify access tokens are valid
 - Ensure PRs exist in date range
 
-### Review Fails
+#### Review Fails
 - Verify Claude API key is valid
 - Check API rate limits
 - Review error logs for details
 
-### Comments Not Posting
+#### Comments Not Posting
 - Ensure DRY_RUN=false
 - Check platform permissions
 - Verify MCP server is accessible
+
+### Sub-Agent Issues
+
+#### Sub-agent not found
+**Symptom**: `Error: Agent 'test-analyzer' not found`
+
+**Solution**:
+```bash
+# Verify agent file exists
+ls .claude/agents/test-analyzer.md
+
+# Check YAML frontmatter is valid
+head -n 10 .claude/agents/test-analyzer.md
+
+# Ensure file has correct structure:
+# ---
+# description: Agent description
+# model: sonnet
+# tools:
+#   - Read
+#   - Grep
+# ---
+```
+
+#### State persistence fails
+**Symptom**: `Error: ENOENT: no such file or directory, open 'data/states/...'`
+
+**Solution**:
+```bash
+# Create state directory
+mkdir -p data/states
+
+# Check permissions
+chmod 755 data/states
+
+# Verify write access
+touch data/states/test && rm data/states/test
+```
+
+#### Parallel analysis timeout
+**Symptom**: Review takes >5 minutes or times out
+
+**Solution**:
+1. Check Claude API rate limits in logs
+2. Reduce parallelism in config:
+   ```json
+   { "features": { "useSubAgents": false } }
+   ```
+3. Check individual agent timeouts in `SubAgentOrchestrator`
+4. Review network connectivity to Claude API
+
+#### Conflicting review findings
+**Symptom**: Same issue reported multiple times or contradictory feedback
+
+**Solution**:
+1. Check synthesis logic in `ReviewSynthesizer`
+2. Verify deduplication is working
+3. Review agent prompts for overlapping responsibilities
+4. Check `DecisionMatrix` thresholds
 
 ## Environment Variables
 
