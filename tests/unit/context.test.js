@@ -1,4 +1,5 @@
 import { jest } from '@jest/globals';
+import Context from '../../app/context.js';
 
 // Mock MCP utils module
 jest.mock('../../app/mcp-utils.js', () => ({
@@ -13,7 +14,6 @@ describe('Context Module', () => {
   let mcpUtils;
 
   beforeEach(async () => {
-    jest.resetModules();
     jest.clearAllMocks();
 
     // Get the mocked utils
@@ -21,7 +21,8 @@ describe('Context Module', () => {
 
     // Setup mock client
     mockClient = {
-      request: jest.fn()
+      request: jest.fn(),
+      callTool: jest.fn()
     };
 
     mcpUtils.createConnectedGitLabClient.mockResolvedValue(mockClient);
@@ -31,8 +32,8 @@ describe('Context Module', () => {
       return typeof text === 'string' ? JSON.parse(text) : text;
     });
 
-    const contextModule = await import('../../app/context.js');
-    context = contextModule.default;
+    // Create fresh instance
+    context = new Context();
   });
 
   afterEach(() => {
@@ -75,7 +76,7 @@ describe('Context Module', () => {
         }
       ];
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -106,7 +107,7 @@ describe('Context Module', () => {
         }
       ];
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -137,7 +138,7 @@ describe('Context Module', () => {
         content: '{"name": "test", "version": "1.0.0"}'
       };
 
-      mockClient.request
+      mockClient.callTool
         .mockResolvedValueOnce({ // Diff request
           content: [{
             type: 'text',
@@ -168,7 +169,7 @@ describe('Context Module', () => {
         diff: '@@ -1,1 +1,1 @@\n-old\n+new'
       }));
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -182,7 +183,7 @@ describe('Context Module', () => {
     });
 
     it('should handle MCP errors gracefully', async () => {
-      mockClient.request.mockRejectedValue(new Error('MCP error'));
+      mockClient.callTool.mockRejectedValue(new Error('MCP error'));
 
       const prContext = await context.buildContext(mockPR, mockConfig);
 
@@ -196,7 +197,7 @@ describe('Context Module', () => {
           deletions: 0,
           totalLines: 0
         },
-        error: 'Failed to get PR context'
+        error: 'Failed to get PR context: MCP error'
       });
     });
 
@@ -216,7 +217,7 @@ describe('Context Module', () => {
         }
       ];
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -253,7 +254,7 @@ describe('Context Module', () => {
         }
       };
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify([])
@@ -295,7 +296,7 @@ describe('Context Module', () => {
         }
       };
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify([])
@@ -304,11 +305,12 @@ describe('Context Module', () => {
 
       await context.buildContext(pr, config);
 
-      expect(mockClient.request).toHaveBeenCalledWith(
+      expect(mockClient.callTool).toHaveBeenCalledWith(
         expect.objectContaining({
-          method: 'tools/call',
-          params: expect.objectContaining({
-            name: expect.stringContaining('get_merge_request_diffs')
+          name: 'get_merge_request_diffs',
+          arguments: expect.objectContaining({
+            project_id: 'project/repo',
+            merge_request_iid: '10'
           })
         })
       );
@@ -377,7 +379,7 @@ describe('Context Module', () => {
         }
       ];
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)

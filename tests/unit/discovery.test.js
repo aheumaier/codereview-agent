@@ -1,4 +1,5 @@
 import { jest } from '@jest/globals';
+import Discovery from '../../app/discovery.js';
 
 // Mock MCP utils module
 jest.mock('../../app/mcp-utils.js', () => ({
@@ -13,7 +14,6 @@ describe('Discovery Module', () => {
   let mcpUtils;
 
   beforeEach(async () => {
-    jest.resetModules();
     jest.clearAllMocks();
 
     // Get the mocked utils
@@ -31,8 +31,8 @@ describe('Discovery Module', () => {
       return typeof text === 'string' ? JSON.parse(text) : text;
     });
 
-    const discoveryModule = await import('../../app/discovery.js');
-    discovery = discoveryModule.default;
+    // Create fresh instance
+    discovery = new Discovery();
   });
 
   afterEach(() => {
@@ -45,7 +45,8 @@ describe('Discovery Module', () => {
         gitlab: {
           enabled: true,
           token: 'test-token',
-          url: 'https://gitlab.com/api/v4'
+          url: 'https://gitlab.com/api/v4',
+          projectId: 'test/project'
         },
         github: {
           enabled: false
