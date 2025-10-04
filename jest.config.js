@@ -3,8 +3,13 @@ export default {
   transform: {
     '^.+\\.js$': 'babel-jest'
   },
+  transformIgnorePatterns: [
+    'node_modules/(?!(@modelcontextprotocol)/)'
+  ],
   testMatch: [
-    '**/tests/unit/**/*.test.js'
+    '**/tests/unit/**/*.test.js',
+    '**/tests/integration/**/*.test.js',
+    '**/tests/performance/**/*.test.js'
   ],
   collectCoverageFrom: [
     'app/**/*.js',
