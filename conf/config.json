@@ -7,7 +7,11 @@
     "maxLinesPerFile": 1000,
     "contextLines": 10,
     "minCoveragePercent": 80,
-    "maxComplexity": 10
+    "maxComplexity": 10,
+    "parallelReviews": {
+      "enabled": true,
+      "temperatures": [0, 0.3]
+    }
   },
   "platforms": {
     "gitlab": {
@@ -41,5 +45,11 @@
   "tracking": {
     "dbPath": "./data/reviews.db",
     "ttlDays": 30
+  },
+  "features": {
+    "useStateManagement": true,
+    "useSubAgents": true,
+    "useDecisionMatrix": false,
+    "legacyMode": true
   }
 }

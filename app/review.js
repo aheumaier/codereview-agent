@@ -309,12 +309,22 @@ Return ONLY the JSON object, no explanations.`;
       const outputComments = merged.comments?.length || 0;
       console.log(`  MECE merge: ${inputComments} input comments → ${outputComments} unique`);
 
+      // Clean up internal metadata before returning
+      delete merged._reviewNumber;
+      delete merged._temperature;
+
       return merged;
 
     } catch (error) {
       console.error('Claude MECE merge failed:', error.message);
       console.log('  Falling back to first review');
-      return reviews[0];
+
+      // Clean up metadata from fallback review too
+      const fallbackReview = { ...reviews[0] };
+      delete fallbackReview._reviewNumber;
+      delete fallbackReview._temperature;
+
+      return fallbackReview;
     }
   }
 
@@ -329,127 +339,6 @@ Return ONLY the JSON object, no explanations.`;
     return await this.mergeReviewsWithClaude(reviews, config);
   }
 
-  /**
-   * Get severity weight for comparison
-   * @param {string} severity - Severity level
-   * @returns {number} Numeric weight
-   */
-  getSeverityWeight(severity) {
-    const weights = {
-      critical: 3,
-      major: 2,
-      minor: 1
-    };
-    return weights[severity] || 0;
-  }
-
-  /**
-   * Aggregate decisions from multiple reviews (most conservative)
-   * @param {Array<string>} decisions - Array of decision strings
-   * @returns {string} Aggregated decision
-   */
-  aggregateDecision(decisions) {
-    // Priority order (most conservative first)
-    const priorityOrder = ['changes_requested', 'needs_work', 'approved', 'error'];
-
-    for (const priority of priorityOrder) {
-      if (decisions.includes(priority)) {
-        return priority;
-      }
-    }
-
-    return 'needs_work'; // Default fallback
-  }
-
-  /**
-   * Combine summaries from multiple reviews
-   * @param {Array<Object>} reviews - Array of reviews
-   * @param {string} strategy - Synthesis strategy used
-   * @param {number} uniqueCount - Number of unique issues
-   * @returns {string} Combined summary
-   */
-  combineSummaries(reviews, strategy = 'union', uniqueCount = 0) {
-    const individualCounts = reviews.map((r, i) =>
-      `Review #${i + 1} (temp=${r._temperature || 'unknown'}): ${r.comments?.length || 0} issues`
-    ).join(', ');
-
-    const strategyDesc = {
-      union: 'comprehensive',
-      intersection: 'high-confidence',
-      weighted: 'balanced'
-    }[strategy] || strategy;
-
-    return `Synthesized ${strategyDesc} review from ${reviews.length} parallel analyses. ` +
-           `${individualCounts}. ` +
-           `Total unique issues: ${uniqueCount}`;
-  }
-
-  /**
-   * Count issues by severity
-   * @param {Array<Object>} comments - Array of comments
-   * @returns {Object} Issue counts by severity
-   */
-  countIssues(comments) {
-    const issues = {
-      critical: 0,
-      major: 0,
-      minor: 0
-    };
-
-    for (const comment of comments) {
-      const severity = comment.severity || 'minor';
-      issues[severity] = (issues[severity] || 0) + 1;
-    }
-
-    return issues;
-  }
-
-  /**
-   * Get the higher severity between two
-   * @param {string} s1 - First severity
-   * @param {string} s2 - Second severity
-   * @returns {string} Higher severity
-   */
-  getHigherSeverity(s1, s2) {
-    const w1 = this.getSeverityWeight(s1);
-    const w2 = this.getSeverityWeight(s2);
-    return w1 >= w2 ? s1 : s2;
-  }
-
-  /**
-   * Reduce severity by one level
-   * @param {string} severity - Original severity
-   * @returns {string} Reduced severity
-   */
-  reduceSeverity(severity) {
-    const reductions = {
-      critical: 'major',
-      major: 'minor',
-      minor: 'minor'
-    };
-    return reductions[severity] || severity;
-  }
-
-  /**
-   * Merge suggestions from a group of comments
-   * @param {Array<Object>} group - Group of similar comments
-   * @returns {string|undefined} Merged suggestions
-   */
-  mergeSuggestions(group) {
-    const suggestions = group
-      .map(c => c.suggestion)
-      .filter(s => s && s.trim());
-
-    if (suggestions.length === 0) return undefined;
-    if (suggestions.length === 1) return suggestions[0];
-
-    // Remove duplicates and join with alternative markers
-    const unique = [...new Set(suggestions)];
-    if (unique.length === 1) return unique[0];
-
-    return unique[0] + '\n\n**Alternative approaches:**\n' +
-           unique.slice(1).map(s => '- ' + s).join('\n');
-  }
 
   /**
    * Build review prompt for Claude
