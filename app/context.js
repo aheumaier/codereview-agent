@@ -123,7 +123,7 @@ class Context {
         async () => client.callTool({
           name: 'get_merge_request_diffs',
           arguments: {
-            project_id: pr.project_id,
+            project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
             merge_request_iid: pr.iid || pr.id
           }
         }),
@@ -269,6 +269,7 @@ class Context {
   async getFileContents(client, pr, diff, config) {
     const files = [];
     const importantFiles = ['package.json', 'Dockerfile', '.env', 'config.json'];
+    const platformConfig = config.platforms?.[pr.platform] || {};
 
     for (const file of diff) {
       const fileName = file.new_path || file.old_path;
@@ -290,7 +291,7 @@ class Context {
             async () => client.callTool({
               name: 'get_file_contents',
               arguments: {
-                project_id: pr.project_id,
+                project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
                 file_path: fileName,
                 ref: pr.source_branch
               }
@@ -354,4 +355,4 @@ class Context {
   }
 }
 
-export default new Context();
+export default Context;

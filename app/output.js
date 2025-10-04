@@ -131,7 +131,7 @@ class Output {
           params: {
             name: 'mcp__gitlab__create_note',
             arguments: {
-              project_id: pr.project_id,
+              project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
               noteable_type: 'merge_request',
               noteable_iid: pr.iid || pr.id,
               body: this.formatSummary(review)
@@ -151,7 +151,7 @@ class Output {
               params: {
                 name: 'mcp__gitlab__create_merge_request_thread',
                 arguments: {
-                  project_id: pr.project_id,
+                  project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
                   merge_request_iid: pr.iid || pr.id,
                   body: this.formatComment(comment),
                   position: {
@@ -173,7 +173,7 @@ class Output {
               params: {
                 name: 'mcp__gitlab__create_note',
                 arguments: {
-                  project_id: pr.project_id,
+                  project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
                   noteable_type: 'merge_request',
                   noteable_iid: pr.iid || pr.id,
                   body: this.formatComment(comment)
@@ -195,7 +195,7 @@ class Output {
           params: {
             name: 'mcp__gitlab__approve_merge_request',
             arguments: {
-              project_id: pr.project_id,
+              project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
               merge_request_iid: pr.iid || pr.id
             }
           }
@@ -319,4 +319,4 @@ class Output {
   }
 }
 
-export default new Output();
+export default Output;

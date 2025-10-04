@@ -178,4 +178,4 @@ class Tracker {
   }
 }
 
-export default new Tracker();
+export default Tracker;

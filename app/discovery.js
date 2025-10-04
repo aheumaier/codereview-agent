@@ -145,6 +145,7 @@ class Discovery {
 
       return allPRs.map(pr => ({
         platform: 'gitlab',
+        project_path: platformConfig.projectId,  // Add path format for MCP calls
         ...pr
       }));
 
@@ -291,4 +292,4 @@ class Discovery {
   }
 }
 
-export default new Discovery();
+export default Discovery;
