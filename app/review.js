@@ -48,46 +48,8 @@ class Review {
     try {
       this.initializeClient(config.claude.apiKey);
 
-      // Check if parallel reviews are enabled
-      const parallelConfig = config.review?.parallelReviews;
-      if (parallelConfig?.enabled) {
-        return await this.runParallelReviews(context, config);
-      }
-
-      // Single review flow (existing logic)
-      const prompt = this.buildReviewPrompt(context, config);
-
-      const response = await retryWithBackoff(
-        async () => this.anthropic.messages.create({
-          model: config.claude.model,
-          max_tokens: config.claude.maxTokens,
-          temperature: config.claude.temperature || 0,
-          messages: [
-            {
-              role: 'user',
-              content: prompt
-            }
-          ]
-        }),
-        {
-          maxRetries: 3,
-          initialDelay: 2000, // Longer initial delay for LLM APIs
-          shouldRetry: (error) => {
-            // Check for rate limiting or overloaded responses
-            if (error.status === 429 || error.status === 529) {
-              return true;
-            }
-            // Use default retry logic for other errors
-            return isRetryableError(error);
-          },
-          onRetry: (error, attempt, delay) => {
-            console.log(`  Retrying Claude API call (attempt ${attempt}/3) after ${delay}ms: ${error.message || error.status}`);
-          }
-        }
-      );
-
-      const reviewText = response.content[0].text;
-      return this.parseReviewResponse(reviewText);
+      // Use parallel reviews (always enabled)
+      return await this.runParallelReviews(context, config);
 
     } catch (error) {
       const wrappedError = wrapError(error, 'Review failed');

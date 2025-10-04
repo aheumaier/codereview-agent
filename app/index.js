@@ -67,19 +67,6 @@ class CodeReviewAgent {
           performanceFindings: state.findings.performance,
           architectureFindings: state.findings.architecture
         };
-      } else {
-        // Transition to review phase
-        state.transitionTo('review');
-        console.log('🧠 Performing legacy review...');
-
-        // Perform legacy review
-        reviewResult = await review.reviewPR(state.context, config);
-        state.findings = {
-          test: reviewResult.testFindings || [],
-          security: reviewResult.securityFindings || [],
-          performance: reviewResult.performanceFindings || [],
-          architecture: reviewResult.architectureFindings || []
-        };
       }
 
       // Transition to synthesis
@@ -251,86 +238,6 @@ class CodeReviewAgent {
     return metrics;
   }
 
-  /**
-   * Run legacy review flow (existing implementation)
-   * @param {Object} pr - Pull request
-   * @param {Object} config - Configuration
-   * @param {Tracker} tracker - Review tracker
-   * @returns {Object} Review result
-   */
-  async runLegacyReview(pr, config, tracker) {
-    const context = new Context();
-    const review = new Review();
-    const output = new Output();
-    const isDryRun = config.output.dryRun === true || config.output.dryRun === 'true';
-
-    // Check if already reviewed (skip in dry-run mode)
-    if (!isDryRun) {
-      const alreadyReviewed = await tracker.hasReviewed(
-        pr.platform,
-        pr.project_id || pr.repository,
-        pr.id,
-        pr.updated_at
-      );
-
-      if (alreadyReviewed) {
-        console.log('⏭️  Already reviewed, skipping...');
-        return { skipped: true };
-      }
-    } else {
-      console.log('🔸 DRY RUN MODE - Ignoring review history');
-    }
-
-    // Build context
-    console.log('📦 Building context...');
-    const prContext = await context.buildContext(pr, config);
-
-    if (prContext.error) {
-      throw new Error(`Context error: ${prContext.error}`);
-    }
-
-    console.log(`   Files: ${prContext.stats.filesChanged}`);
-    console.log(`   Changes: +${prContext.stats.additions} -${prContext.stats.deletions}`);
-
-    // Perform review
-    console.log('🧠 Analyzing with Claude...');
-    const reviewResult = await review.reviewPR(prContext, config);
-
-    if (reviewResult.error) {
-      throw new Error(`Review error: ${reviewResult.error}`);
-    }
-
-    console.log(`   Decision: ${reviewResult.decision}`);
-    console.log(`   Issues: ${reviewResult.comments?.length || 0}`);
-
-    // Post review
-    console.log('📮 Posting review...');
-    const postResult = await output.postReview(pr, reviewResult, config);
-
-    if (postResult.dryRun) {
-      console.log('🔸 DRY RUN - Review not posted');
-    } else if (postResult.posted) {
-      console.log('✅ Review posted successfully');
-    } else {
-      throw new Error(`Failed to post: ${postResult.error}`);
-    }
-
-    // Mark as reviewed (skip in dry-run mode)
-    if (!isDryRun) {
-      await tracker.markReviewed({
-        platform: pr.platform,
-        repository: pr.project_id || pr.repository,
-        prId: pr.id,
-        sha: pr.sha || pr.head_sha,
-        summary: reviewResult.summary,
-        decision: reviewResult.decision,
-        comments: reviewResult.comments,
-        prUpdatedAt: pr.updated_at
-      });
-    }
-
-    return { reviewed: true, reviewResult };
-  }
 
   /**
    * Validate PR object has required fields
@@ -491,16 +398,6 @@ class CodeReviewAgent {
               reviewed++;
             } else {
               errors++;
-            }
-
-          } else {
-            // Legacy flow
-            const result = await this.runLegacyReview(pr, config, tracker);
-
-            if (result.skipped) {
-              skipped++;
-            } else if (result.reviewed) {
-              reviewed++;
             }
           }
 

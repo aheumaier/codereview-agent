@@ -161,15 +161,6 @@ class FindingAggregator {
     return grouped;
   }
 
-  /**
-   * Compare severity levels
-   * @param {String} sev1 - First severity
-   * @param {String} sev2 - Second severity
-   * @returns {Boolean} True if sev1 is higher than sev2
-   */
-  isSeverityHigher(sev1, sev2) {
-    return this.severityOrder[sev1] < this.severityOrder[sev2];
-  }
 }
 
 export default FindingAggregator;

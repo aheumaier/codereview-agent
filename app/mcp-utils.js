@@ -135,20 +135,3 @@ export function parseMCPResponse(response) {
 // Future platform support stubs (following Open/Closed Principle)
 // These can be implemented when needed without modifying existing code
 
-/**
- * Creates a GitHub MCP transport (stub for future implementation)
- * @param {Object} config - Configuration object
- * @returns {StdioClientTransport} Transport instance
- */
-export function createGitHubTransport(config) {
-  throw new Error('GitHub MCP transport not yet implemented');
-}
-
-/**
- * Creates a Bitbucket MCP transport (stub for future implementation)
- * @param {Object} config - Configuration object
- * @returns {StdioClientTransport} Transport instance
- */
-export function createBitbucketTransport(config) {
-  throw new Error('Bitbucket MCP transport not yet implemented');
-}
