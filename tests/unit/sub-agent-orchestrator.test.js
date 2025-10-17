@@ -52,7 +52,7 @@ describe('SubAgentOrchestrator', () => {
       jest.restoreAllMocks();
     });
 
-    it('should execute all 4 agents in parallel', async () => {
+    it('should execute all 4 agents + validator (5 total)', async () => {
       const mockResponse = {
         findings: [
           {
@@ -65,27 +65,135 @@ describe('SubAgentOrchestrator', () => {
         metrics: {}
       };
 
+      const validatorResponse = {
+        findings: [
+          {
+            file: 'test.js',
+            line: 10,
+            severity: 'major',
+            category: 'testing',
+            message: 'Missing test coverage',
+            confidence: 0.9
+          }
+        ],
+        validationStats: {
+          totalInputFindings: 4,
+          duplicatesRemoved: 2,
+          lowConfidenceFiltered: 1,
+          falsePositivesRemoved: 0,
+          finalCount: 1
+        }
+      };
+
       // Mock invokeAgent to return successful responses
-      orchestrator.invokeAgent = jest.fn().mockResolvedValue(JSON.stringify(mockResponse));
+      orchestrator.invokeAgent = jest.fn()
+        .mockImplementation((agent) => {
+          if (agent === 'validator') {
+            return Promise.resolve(JSON.stringify(validatorResponse));
+          }
+          return Promise.resolve(JSON.stringify(mockResponse));
+        });
 
       await orchestrator.executeParallelAnalysis(mockState, {});
 
-      // Should have been called 4 times (test, security, performance, architecture)
-      expect(orchestrator.invokeAgent).toHaveBeenCalledTimes(4);
+      // Should have been called 5 times (4 analyzers + 1 validator)
+      expect(orchestrator.invokeAgent).toHaveBeenCalledTimes(5);
       expect(orchestrator.invokeAgent).toHaveBeenCalledWith('test-analyzer', expect.any(String));
       expect(orchestrator.invokeAgent).toHaveBeenCalledWith('security-analyzer', expect.any(String));
       expect(orchestrator.invokeAgent).toHaveBeenCalledWith('performance-analyzer', expect.any(String));
       expect(orchestrator.invokeAgent).toHaveBeenCalledWith('architecture-analyzer', expect.any(String));
+      expect(orchestrator.invokeAgent).toHaveBeenCalledWith('validator', expect.any(String));
     });
 
-    it('should populate state.findings.test with test agent results', async () => {
-      const testFindings = [
+    it('should store validated findings in state.findings array', async () => {
+      const validatedFindings = [
         {
           file: 'test.spec.js',
+          line: 42,
           severity: 'major',
-          category: 'test_coverage',
-          message: 'Missing test coverage'
+          category: 'testing',
+          message: 'Missing test coverage',
+          confidence: 0.9
         }
+      ];
+
+      const validatorResponse = {
+        findings: validatedFindings,
+        validationStats: {
+          totalInputFindings: 10,
+          duplicatesRemoved: 5,
+          finalCount: 1
+        }
+      };
+
+      orchestrator.invokeAgent = jest.fn()
+        .mockImplementation((agent) => {
+          if (agent === 'validator') {
+            return Promise.resolve(JSON.stringify(validatorResponse));
+          }
+          return Promise.resolve(JSON.stringify({ findings: [] }));
+        });
+
+      await orchestrator.executeParallelAnalysis(mockState, {});
+
+      expect(mockState.findings).toEqual(validatedFindings);
+      expect(mockState.validationStats).toEqual(validatorResponse.validationStats);
+    });
+
+    it('should deduplicate findings via validator', async () => {
+      const testFindings = [
+        { file: 'app.js', line: 10, severity: 'major', message: 'Missing test' }
+      ];
+      const securityFindings = [
+        { file: 'app.js', line: 10, severity: 'critical', message: 'Missing validation' }
+      ];
+
+      // Validator consolidates duplicate (same file + line) into one
+      const validatorResponse = {
+        findings: [
+          {
+            file: 'app.js',
+            line: 10,
+            severity: 'critical', // Keeps highest severity
+            category: 'security',
+            message: 'Missing input validation (also lacks test coverage)',
+            sources: ['security-analyzer', 'test-analyzer'],
+            confidence: 1.0
+          }
+        ],
+        validationStats: {
+          totalInputFindings: 2,
+          duplicatesRemoved: 1,
+          finalCount: 1
+        }
+      };
+
+      orchestrator.invokeAgent = jest.fn()
+        .mockImplementation((agent) => {
+          if (agent === 'test-analyzer') {
+            return Promise.resolve(JSON.stringify({ findings: testFindings }));
+          }
+          if (agent === 'security-analyzer') {
+            return Promise.resolve(JSON.stringify({ findings: securityFindings }));
+          }
+          if (agent === 'validator') {
+            return Promise.resolve(JSON.stringify(validatorResponse));
+          }
+          return Promise.resolve(JSON.stringify({ findings: [] }));
+        });
+
+      await orchestrator.executeParallelAnalysis(mockState, {});
+
+      expect(mockState.findings).toHaveLength(1);
+      expect(mockState.validationStats.duplicatesRemoved).toBe(1);
+    });
+
+    it('should handle validator failure with fallback to raw findings', async () => {
+      const testFindings = [
+        { file: 'test.js', severity: 'major', message: 'Test issue' }
+      ];
+      const securityFindings = [
+        { file: 'auth.js', severity: 'critical', message: 'Security issue' }
       ];
 
       orchestrator.invokeAgent = jest.fn()
@@ -93,98 +201,21 @@ describe('SubAgentOrchestrator', () => {
           if (agent === 'test-analyzer') {
             return Promise.resolve(JSON.stringify({ findings: testFindings }));
           }
-          return Promise.resolve(JSON.stringify({ findings: [] }));
-        });
-
-      await orchestrator.executeParallelAnalysis(mockState, {});
-
-      expect(mockState.findings.test).toEqual(testFindings);
-    });
-
-    it('should populate state.findings.security with security agent results', async () => {
-      const securityFindings = [
-        {
-          file: 'auth.js',
-          severity: 'critical',
-          category: 'security',
-          message: 'SQL injection vulnerability'
-        }
-      ];
-
-      orchestrator.invokeAgent = jest.fn()
-        .mockImplementation((agent) => {
           if (agent === 'security-analyzer') {
             return Promise.resolve(JSON.stringify({ findings: securityFindings }));
           }
-          return Promise.resolve(JSON.stringify({ findings: [] }));
-        });
-
-      await orchestrator.executeParallelAnalysis(mockState, {});
-
-      expect(mockState.findings.security).toEqual(securityFindings);
-    });
-
-    it('should populate state.findings.performance with performance results', async () => {
-      const performanceFindings = [
-        {
-          file: 'loop.js',
-          severity: 'major',
-          category: 'performance',
-          message: 'O(n²) complexity detected'
-        }
-      ];
-
-      orchestrator.invokeAgent = jest.fn()
-        .mockImplementation((agent) => {
-          if (agent === 'performance-analyzer') {
-            return Promise.resolve(JSON.stringify({ findings: performanceFindings }));
+          if (agent === 'validator') {
+            return Promise.reject(new Error('Validator failed'));
           }
           return Promise.resolve(JSON.stringify({ findings: [] }));
         });
 
       await orchestrator.executeParallelAnalysis(mockState, {});
 
-      expect(mockState.findings.performance).toEqual(performanceFindings);
-    });
-
-    it('should populate state.findings.architecture with architecture results', async () => {
-      const architectureFindings = [
-        {
-          file: 'controller.js',
-          severity: 'minor',
-          category: 'architecture',
-          message: 'SRP violation'
-        }
-      ];
-
-      orchestrator.invokeAgent = jest.fn()
-        .mockImplementation((agent) => {
-          if (agent === 'architecture-analyzer') {
-            return Promise.resolve(JSON.stringify({ findings: architectureFindings }));
-          }
-          return Promise.resolve(JSON.stringify({ findings: [] }));
-        });
-
-      await orchestrator.executeParallelAnalysis(mockState, {});
-
-      expect(mockState.findings.architecture).toEqual(architectureFindings);
-    });
-
-    it('should handle partial failures gracefully (error boundaries)', async () => {
-      orchestrator.invokeAgent = jest.fn()
-        .mockImplementation((agent) => {
-          if (agent === 'test-analyzer') {
-            return Promise.reject(new Error('Test agent failed'));
-          }
-          return Promise.resolve(JSON.stringify({ findings: [] }));
-        });
-
-      await orchestrator.executeParallelAnalysis(mockState, {});
-
-      // Other findings should still be populated
-      expect(mockState.findings.security).toEqual([]);
-      expect(mockState.findings.performance).toEqual([]);
-      expect(mockState.findings.architecture).toEqual([]);
+      // Should fallback to raw findings without validation
+      expect(mockState.findings.length).toBe(2);
+      expect(mockState.validationStats.duplicatesRemoved).toBe(0);
+      expect(mockState.validationStats.finalCount).toBe(2);
     });
 
     it('should add errors to state when agent fails', async () => {
@@ -215,13 +246,19 @@ describe('SubAgentOrchestrator', () => {
           if (agent === 'test-analyzer') {
             return Promise.reject(new Error('Failed'));
           }
+          if (agent === 'validator') {
+            return Promise.resolve(JSON.stringify({
+              findings: [],
+              validationStats: { totalInputFindings: 0, finalCount: 0 }
+            }));
+          }
           return Promise.resolve(JSON.stringify({ findings: [] }));
         });
 
       await orchestrator.executeParallelAnalysis(mockState, {});
 
-      // All 4 agents should have been invoked despite one failing
-      expect(callCount).toBe(4);
+      // All 4 agents + validator should have been invoked despite one analyzer failing
+      expect(callCount).toBe(5);
     });
 
     it('should transition state to synthesis after completion', async () => {

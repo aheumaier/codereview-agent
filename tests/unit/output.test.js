@@ -11,6 +11,13 @@ jest.mock('child_process', () => ({
   spawn: jest.fn()
 }));
 
+jest.mock('../../app/mcp-utils.js', () => ({
+  createConnectedGitLabClient: jest.fn(),
+  createConnectedGitHubClient: jest.fn(),
+  safeCloseClient: jest.fn(),
+  parseMCPResponse: jest.fn()
+}));
+
 // NOW it's safe to import (mocks are already in place)
 import Output from '../../app/output.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -323,6 +330,239 @@ describe('Output Module', () => {
 
       // Should still attempt to close connection
       expect(mockClient.close).toHaveBeenCalled();
+
+      consoleSpy.mockRestore();
+    });
+  });
+
+  describe('GitHub specific output', () => {
+    let mockGitHubClient;
+    let mockTransport;
+    let mcpUtils;
+
+    beforeEach(async () => {
+      // Get the mocked utils
+      mcpUtils = await import('../../app/mcp-utils.js');
+
+      mockGitHubClient = {
+        request: jest.fn(),
+        close: jest.fn()
+      };
+      mockTransport = {
+        close: jest.fn()
+      };
+
+      mcpUtils.createConnectedGitHubClient.mockResolvedValue({
+        client: mockGitHubClient,
+        transport: mockTransport
+      });
+
+      mcpUtils.parseMCPResponse.mockImplementation((response) => {
+        if (!response?.content?.[0]?.text) return {};
+        const text = response.content[0].text;
+        return typeof text === 'string' ? JSON.parse(text) : text;
+      });
+    });
+
+    const mockGitHubPR = {
+      platform: 'github',
+      id: '42',
+      number: 42,
+      repository: 'owner/repo',
+      owner: 'owner',
+      repo: 'repo',
+      head_sha: 'abc123',
+      title: 'GitHub PR'
+    };
+
+    const mockGitHubReview = {
+      summary: 'GitHub review summary',
+      decision: 'approved',
+      comments: [
+        {
+          file: 'src/app.js',
+          line: 10,
+          severity: 'minor',
+          message: 'Use const instead of let'
+        }
+      ],
+      issues: {
+        critical: 0,
+        major: 0,
+        minor: 1
+      }
+    };
+
+    const mockGitHubConfig = {
+      platforms: {
+        github: {
+          enabled: true,
+          token: 'github-token'
+        }
+      },
+      output: {
+        dryRun: false,
+        postComments: true,
+        postSummary: true
+      }
+    };
+
+    it('should post GitHub review using three-step workflow', async () => {
+      // Mock successful review creation
+      mockGitHubClient.request
+        .mockResolvedValueOnce({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ id: 'review-123' })
+          }]
+        })
+        // Mock successful comment addition
+        .mockResolvedValueOnce({ success: true })
+        // Mock successful review submission
+        .mockResolvedValueOnce({ success: true });
+
+      const result = await output.postReview(mockGitHubPR, mockGitHubReview, mockGitHubConfig);
+
+      expect(result).toMatchObject({
+        posted: true,
+        decision: 'approved',
+        reviewId: 'review-123'
+      });
+
+      // Verify three-step workflow
+      // Step 1: Create pending review
+      expect(mockGitHubClient.request).toHaveBeenNthCalledWith(1, {
+        method: 'tools/call',
+        params: {
+          name: 'create_pending_pull_request_review',
+          arguments: {
+            owner: 'owner',
+            repo: 'repo',
+            pull_number: 42,
+            commit_id: 'abc123',
+            body: expect.stringContaining('Code Review Summary')
+          }
+        }
+      });
+
+      // Step 2: Add comment
+      expect(mockGitHubClient.request).toHaveBeenNthCalledWith(2, {
+        method: 'tools/call',
+        params: {
+          name: 'add_pull_request_review_comment_to_pending_review',
+          arguments: {
+            owner: 'owner',
+            repo: 'repo',
+            pull_number: 42,
+            review_id: 'review-123',
+            body: expect.stringContaining('Use const instead of let'),
+            path: 'src/app.js',
+            line: 10,
+            side: 'RIGHT'
+          }
+        }
+      });
+
+      // Step 3: Submit review
+      expect(mockGitHubClient.request).toHaveBeenNthCalledWith(3, {
+        method: 'tools/call',
+        params: {
+          name: 'submit_pending_pull_request_review',
+          arguments: {
+            owner: 'owner',
+            repo: 'repo',
+            pull_number: 42,
+            review_id: 'review-123',
+            event: 'APPROVE',
+            body: expect.stringContaining('looks good')
+          }
+        }
+      });
+    });
+
+    it('should map review decisions to GitHub events correctly', async () => {
+      const decisions = [
+        { decision: 'approved', expectedEvent: 'APPROVE' },
+        { decision: 'changes_requested', expectedEvent: 'REQUEST_CHANGES' },
+        { decision: 'needs_work', expectedEvent: 'REQUEST_CHANGES' },
+        { decision: 'comment', expectedEvent: 'COMMENT' }
+      ];
+
+      for (const { decision, expectedEvent } of decisions) {
+        mockGitHubClient.request
+          .mockResolvedValueOnce({
+            content: [{
+              type: 'text',
+              text: JSON.stringify({ id: 'review-123' })
+            }]
+          })
+          .mockResolvedValue({ success: true });
+
+        const review = { ...mockGitHubReview, decision, comments: [] };
+        await output.postReview(mockGitHubPR, review, mockGitHubConfig);
+
+        const submitCall = mockGitHubClient.request.mock.calls.find(call =>
+          call[0]?.params?.name === 'submit_pending_pull_request_review'
+        );
+
+        expect(submitCall[0].params.arguments.event).toBe(expectedEvent);
+        mockGitHubClient.request.mockClear();
+      }
+    });
+
+    it('should handle dry-run mode for GitHub', async () => {
+      const config = {
+        ...mockGitHubConfig,
+        output: {
+          ...mockGitHubConfig.output,
+          dryRun: true
+        }
+      };
+
+      const consoleSpy = jest.spyOn(console, 'log').mockImplementation();
+
+      const result = await output.postReview(mockGitHubPR, mockGitHubReview, config);
+
+      expect(result).toMatchObject({
+        posted: false,
+        dryRun: true
+      });
+
+      expect(mockGitHubClient.request).not.toHaveBeenCalled();
+      expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining('DRY RUN MODE'));
+
+      consoleSpy.mockRestore();
+    });
+
+    it('should close GitHub transport properly', async () => {
+      mockGitHubClient.request.mockResolvedValue({
+        content: [{
+          type: 'text',
+          text: JSON.stringify({ id: 'review-123' })
+        }]
+      });
+
+      await output.postReview(mockGitHubPR, mockGitHubReview, mockGitHubConfig);
+
+      expect(mcpUtils.safeCloseClient).toHaveBeenCalledWith(mockGitHubClient, 'GitHub output');
+      expect(mockTransport.close).toHaveBeenCalled();
+    });
+
+    it('should handle GitHub API errors gracefully', async () => {
+      mockGitHubClient.request.mockRejectedValue(new Error('GitHub API error'));
+
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      const result = await output.postReview(mockGitHubPR, mockGitHubReview, mockGitHubConfig);
+
+      expect(result).toMatchObject({
+        posted: false,
+        error: expect.stringContaining('Failed to post GitHub review')
+      });
+
+      // Should still clean up resources
+      expect(mcpUtils.safeCloseClient).toHaveBeenCalled();
+      expect(mockTransport.close).toHaveBeenCalled();
 
       consoleSpy.mockRestore();
     });

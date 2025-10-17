@@ -71,6 +71,11 @@ export function isRetryableError(error) {
     return true;
   }
 
+  // Also check error.status (some libraries use this)
+  if (error.status && RETRYABLE_HTTP_STATUSES.has(error.status)) {
+    return true;
+  }
+
   // Check PlatformError status codes
   if (error instanceof PlatformError && error.statusCode) {
     return RETRYABLE_HTTP_STATUSES.has(error.statusCode);
@@ -132,6 +137,43 @@ export function calculateDelay(attempt, options = {}) {
 }
 
 /**
+ * Extract retry-after header value
+ * @param {Error} error - Error object that may contain headers
+ * @returns {number|null} Delay in milliseconds, or null if not found
+ */
+export function extractRetryAfter(error) {
+  // Check various header locations
+  const headers = error.headers || error.response?.headers;
+  if (!headers) return null;
+
+  // Get retry-after value (case-insensitive)
+  let retryAfter;
+  if (typeof headers.get === 'function') {
+    retryAfter = headers.get('retry-after');
+  } else if (typeof headers === 'object') {
+    retryAfter = headers['retry-after'] || headers['Retry-After'] || headers['RETRY-AFTER'];
+  }
+
+  if (!retryAfter) return null;
+
+  // Parse as seconds and convert to milliseconds
+  const seconds = parseInt(retryAfter, 10);
+  if (!isNaN(seconds) && seconds > 0) {
+    return seconds * 1000;
+  }
+
+  // Could be a date string (HTTP-date format)
+  const retryDate = new Date(retryAfter);
+  if (!isNaN(retryDate.getTime())) {
+    const now = Date.now();
+    const delay = retryDate.getTime() - now;
+    return delay > 0 ? delay : null;
+  }
+
+  return null;
+}
+
+/**
  * Sleep for specified milliseconds
  * @param {number} ms - Milliseconds to sleep
  * @returns {Promise<void>} Promise that resolves after delay
@@ -188,8 +230,19 @@ export async function retryWithBackoff(fn, options = {}) {
         throw error;
       }
 
-      // Calculate delay with exponential backoff and jitter
-      const delay = calculateDelay(attempt, config);
+      // Handle 429 with retry-after header (NEW)
+      const retryAfterDelay = extractRetryAfter(error);
+      let delay;
+
+      if (retryAfterDelay !== null) {
+        // Use retry-after header value
+        delay = retryAfterDelay;
+        console.log(`[Retry] Rate limited. Waiting ${delay}ms (from retry-after header)`);
+      } else {
+        // Calculate delay with exponential backoff and jitter
+        delay = calculateDelay(attempt, config);
+        console.debug(`[Retry] Attempt ${attempt + 1}/${config.maxRetries + 1} after ${delay.toFixed(0)}ms`);
+      }
 
       // Call onRetry callback if provided
       if (config.onRetry) {
@@ -203,5 +256,36 @@ export async function retryWithBackoff(fn, options = {}) {
 
   // All retries exhausted, throw last error
   throw lastError;
+}
+
+/**
+ * Enhanced retry wrapper with full jitter and retry-after support
+ * Backward compatible with existing withRetry usage
+ * @param {Function} fn - Async function to retry
+ * @param {Object} options - Retry configuration options
+ * @returns {Promise<any>} Result of successful function call
+ * @throws {Error} Last error if all retries exhausted
+ */
+export async function withRetry(fn, options = {}) {
+  const {
+    maxRetries = 5,
+    baseDelay = 1000,
+    maxDelay = 60000,
+    jitterPercent = 0.1,
+    shouldRetry = isRetryableError
+  } = options;
+
+  // Map to retryWithBackoff config format
+  const backoffConfig = {
+    maxRetries,
+    initialDelay: baseDelay,
+    maxDelay,
+    jitterFactor: jitterPercent,
+    shouldRetry,
+    backoffMultiplier: 2,
+    onRetry: options.onRetry
+  };
+
+  return retryWithBackoff(fn, backoffConfig);
 }
 

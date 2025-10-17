@@ -39,7 +39,7 @@ class Review {
   }
 
   /**
-   * Review a PR using Claude
+   * Review a PR using Claude with sub-agent orchestration
    * @param {Object} context - PR context from context builder
    * @param {Object} config - Configuration
    * @returns {Promise<Object>} Review results
@@ -48,8 +48,9 @@ class Review {
     try {
       this.initializeClient(config.claude.apiKey);
 
-      // Use parallel reviews (always enabled)
-      return await this.runParallelReviews(context, config);
+      // Single review - sub-agent orchestration handles the analysis
+      const prompt = this.buildReviewPrompt(context, config);
+      return await this.runSingleReview(prompt, config);
 
     } catch (error) {
       const wrappedError = wrapError(error, 'Review failed');
@@ -64,78 +65,20 @@ class Review {
   }
 
   /**
-   * Run multiple reviews in parallel and synthesize results
-   * @param {Object} context - PR context
-   * @param {Object} config - Configuration
-   * @returns {Promise<Object>} Synthesized review result
-   */
-  async runParallelReviews(context, config) {
-    const reviewConfig = config.review?.parallelReviews || { enabled: false };
-
-    if (!reviewConfig.enabled) {
-      // Fallback to single review if somehow called without being enabled
-      const prompt = this.buildReviewPrompt(context, config);
-      return await this.runSingleReviewWithTemp(prompt, config, config.claude.temperature || 0, 1);
-    }
-
-    const temperatures = reviewConfig.temperatures || [0.3, 0.5];
-    const prompt = this.buildReviewPrompt(context, config);
-
-    console.log(`🔀 Running ${temperatures.length} parallel reviews...`);
-
-    // Run reviews in parallel
-    const reviewPromises = temperatures.map((temp, index) =>
-      this.runSingleReviewWithTemp(prompt, config, temp, index + 1)
-        .catch(error => {
-          console.error(`  Review #${index + 1} failed: ${error.message}`);
-          return null; // Return null for failed reviews
-        })
-    );
-
-    const reviews = await Promise.all(reviewPromises);
-
-    // Filter out failed reviews
-    const successfulReviews = reviews.filter(r => r !== null && !r.error);
-
-    if (successfulReviews.length === 0) {
-      // All reviews failed
-      return {
-        error: 'All parallel reviews failed',
-        decision: 'error',
-        comments: [],
-        summary: 'Failed to complete any reviews'
-      };
-    }
-
-    if (successfulReviews.length === 1) {
-      // Only one review succeeded, return it
-      console.log('  Only one review succeeded, returning single result');
-      return successfulReviews[0];
-    }
-
-    console.log(`🔗 Synthesizing ${successfulReviews.length} reviews...`);
-
-    // Synthesize results (pass full config, not just reviewConfig)
-    return await this.synthesizeReviews(successfulReviews, config);
-  }
-
-  /**
-   * Run a single review with specific temperature
+   * Run a single review
    * @param {string} prompt - Review prompt
    * @param {Object} config - Configuration
-   * @param {number} temperature - Temperature parameter
-   * @param {number} reviewNumber - Review identifier
    * @returns {Promise<Object>} Review result
    */
-  async runSingleReviewWithTemp(prompt, config, temperature, reviewNumber) {
-    console.log(`  Review #${reviewNumber} (temp=${temperature})...`);
+  async runSingleReview(prompt, config) {
+    console.log(`  Running review analysis...`);
 
     try {
       const response = await retryWithBackoff(
         async () => this.anthropic.messages.create({
           model: config.claude.model,
           max_tokens: config.claude.maxTokens,
-          temperature: temperature,
+          temperature: config.claude.temperature || 0,
           messages: [
             {
               role: 'user',
@@ -148,7 +91,7 @@ class Review {
           initialDelay: 2000,
           shouldRetry: isRetryableError,
           onRetry: (error, attempt, delay) => {
-            console.log(`  Retrying Review #${reviewNumber} (attempt ${attempt}/3) after ${delay}ms: ${error.message || error.status}`);
+            console.log(`  Retrying review (attempt ${attempt}/3) after ${delay}ms: ${error.message || error.status}`);
           }
         }
       );
@@ -156,149 +99,12 @@ class Review {
       const reviewText = response.content[0].text;
       const review = this.parseReviewResponse(reviewText);
 
-      // Tag with review metadata for debugging
-      review._reviewNumber = reviewNumber;
-      review._temperature = temperature;
-
       return review;
 
     } catch (error) {
-      console.error(`  Review #${reviewNumber} error: ${error.message}`);
+      console.error(`  Review error: ${error.message}`);
       throw error;
     }
-  }
-
-  /**
-   * Merge multiple reviews using Claude SDK (MECE principle)
-   * @param {Array<Object>} reviews - Array of review results
-   * @param {Object} config - Configuration
-   * @returns {Promise<Object>} MECE merged review
-   */
-  async mergeReviewsWithClaude(reviews, config) {
-    if (reviews.length === 0) {
-      throw new Error('No reviews to merge');
-    }
-
-    if (reviews.length === 1) {
-      return reviews[0];
-    }
-
-    const prompt = `You are a code review synthesizer applying MECE (Mutually Exclusive, Collectively Exhaustive) principles.
-
-You have ${reviews.length} code reviews of the same pull request from parallel analyses:
-
-${reviews.map((r, i) => `
-**Review ${i + 1}** (temperature=${r._temperature || 'unknown'}):
-- Decision: ${r.decision}
-- Issues: ${r.comments?.length || 0} total
-- Comments:
-${JSON.stringify(r.comments || [], null, 2)}
-`).join('\n')}
-
-## Task: Create ONE MECE merged review
-
-Apply MECE principles:
-1. **Mutually Exclusive**: Merge duplicate issues into one
-   - Same file + same line = definitely duplicate
-   - Same file + similar line (±3) + same problem = likely duplicate
-   - Same semantic issue (e.g., "missing validation" in different words) = duplicate
-
-2. **Collectively Exhaustive**: Include ALL unique issues
-   - Don't discard any unique finding
-   - Preserve different perspectives on same code if they raise distinct concerns
-
-3. **Quality merging**:
-   - Use the clearest explanation for duplicates
-   - Combine suggestions if both add value
-   - Keep highest severity when merging
-   - Preserve resources/links from either review
-
-## Output Format (strict JSON):
-
-{
-  "summary": "Comprehensive summary mentioning all unique issue categories",
-  "decision": "approved|needs_work|changes_requested (most conservative)",
-  "comments": [
-    {
-      "file": "exact/path/to/file.js",
-      "line": 42,
-      "severity": "critical|major|minor",
-      "message": "Clear explanation of the issue",
-      "why": "Why this matters (from clearest review)",
-      "suggestion": "How to fix (merged from both if valuable)",
-      "resources": "Learning link"
-    }
-  ],
-  "issues": {
-    "critical": 0,
-    "major": 0,
-    "minor": 0
-  }
-}
-
-Return ONLY the JSON object, no explanations.`;
-
-    console.log('  Calling Claude SDK for MECE merge...');
-
-    try {
-      const response = await retryWithBackoff(
-        async () => this.anthropic.messages.create({
-          model: config.claude.model,
-          max_tokens: config.claude.maxTokens || 8192,
-          temperature: 0, // Deterministic merging
-          messages: [
-            {
-              role: 'user',
-              content: prompt
-            }
-          ]
-        }),
-        {
-          maxRetries: 3,
-          initialDelay: 2000,
-          shouldRetry: isRetryableError,
-          onRetry: (error, attempt, delay) => {
-            console.log(`  Retrying MECE merge (attempt ${attempt}/3) after ${delay}ms`);
-          }
-        }
-      );
-
-      const mergedText = response.content[0].text;
-      const merged = this.parseReviewResponse(mergedText);
-
-      // Log merge stats
-      const inputComments = reviews.reduce((sum, r) => sum + (r.comments?.length || 0), 0);
-      const outputComments = merged.comments?.length || 0;
-      console.log(`  MECE merge: ${inputComments} input comments → ${outputComments} unique`);
-
-      // Clean up internal metadata before returning
-      delete merged._reviewNumber;
-      delete merged._temperature;
-
-      return merged;
-
-    } catch (error) {
-      console.error('Claude MECE merge failed:', error.message);
-      console.log('  Falling back to first review');
-
-      // Clean up metadata from fallback review too
-      const fallbackReview = { ...reviews[0] };
-      delete fallbackReview._reviewNumber;
-      delete fallbackReview._temperature;
-
-      return fallbackReview;
-    }
-  }
-
-  /**
-   * Synthesize multiple reviews using Claude SDK MECE merge
-   * @param {Array<Object>} reviews - Array of review results
-   * @param {Object} config - Parallel review configuration
-   * @returns {Promise<Object>} Merged review
-   */
-  async synthesizeReviews(reviews, config) {
-    console.log(`  Using Claude SDK MECE merge`);
-    return await this.mergeReviewsWithClaude(reviews, config);
   }
 
 

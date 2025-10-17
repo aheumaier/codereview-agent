@@ -41,55 +41,54 @@ class CodeReviewAgent {
       // Check if sub-agents enabled
       let reviewResult;
       if (featureFlags.isEnabled('useSubAgents')) {
-        // Transition to parallel analysis phase
+        // Phase 1: Parallel Analysis
         state.transitionTo('parallel_analysis');
-        console.log('🔄 Running parallel sub-agent analysis...');
+        console.log('🔄 Phase 1: Parallel sub-agent analysis...');
 
         const SubAgentOrchestrator = (await import('./agents/SubAgentOrchestrator.js')).default;
         const orchestrator = new SubAgentOrchestrator(config);
+
+        // Run parallel analysis with validation phase
+        // SubAgentOrchestrator now handles:
+        // 1. Parallel sub-agent execution
+        // 2. Validation/consolidation phase (MECE)
+        // 3. Returns validated findings in state.findings (array)
         await orchestrator.executeParallelAnalysis(state, config);
 
-        // Aggregate findings from all agents
-        const allFindings = [
-          ...state.findings.test,
-          ...state.findings.security,
-          ...state.findings.performance,
-          ...state.findings.architecture
-        ];
+        // Phase 2: Already completed by validator agent
+        console.log('✅ Phase 2: Validation complete');
+        console.log(`   - Total findings: ${state.findings.length}`);
+        console.log(`   - Duplicates removed: ${state.validationStats?.duplicatesRemoved || 0}`);
+        console.log(`   - False positives removed: ${state.validationStats?.falsePositivesRemoved || 0}`);
 
-        // Create reviewResult from aggregated findings
+        // Create reviewResult from validated findings
         reviewResult = {
-          decision: allFindings.some(f => f.severity === 'critical') ? 'changes_requested' : 'approved',
-          summary: `Sub-agent analysis complete: ${allFindings.length} findings`,
-          comments: allFindings,
-          testFindings: state.findings.test,
-          securityFindings: state.findings.security,
-          performanceFindings: state.findings.performance,
-          architectureFindings: state.findings.architecture
+          decision: state.findings.some(f => f.severity === 'critical') ? 'changes_requested' : 'approved',
+          summary: `Analysis complete: ${state.findings.length} validated findings`,
+          comments: state.findings,
+          validationStats: state.validationStats
         };
       }
 
-      // Transition to synthesis
+      // Phase 3: Synthesis (Decision Making)
       state.transitionTo('synthesis');
-      console.log('🔄 Synthesizing results...');
+      console.log('🔄 Phase 3: Making decision...');
 
-      // Create synthesis components
-      const aggregator = new FindingAggregator();
+      // Findings are already validated and deduplicated by validator agent
+      // No need for additional aggregation - just make decision
       const decisionMatrix = new DecisionMatrix();
-
-      // Aggregate findings from all sub-agents
-      const aggregationResult = aggregator.aggregate(state);
 
       // Collect metrics from state
       const metrics = this.collectMetrics(state);
 
-      // Make decision based on aggregated findings
-      const decision = decisionMatrix.decide(aggregationResult.aggregated, metrics);
+      // Make decision based on validated findings
+      const validatedFindings = state.findings || [];
+      const decision = decisionMatrix.decide(validatedFindings, metrics);
 
       // Update state with synthesis results
       state.synthesis = {
-        aggregated: aggregationResult.aggregated,
-        conflicts: aggregationResult.conflicts,
+        aggregated: validatedFindings,
+        conflicts: [], // Validator already resolved conflicts
         decision: decision.decision,
         rationale: decision.rationale,
         metadata: {
@@ -102,10 +101,7 @@ class CodeReviewAgent {
       };
 
       // Log synthesis results
-      console.log(`📊 Aggregated ${aggregationResult.total} findings`);
-      if (aggregationResult.conflicts.length > 0) {
-        console.log(`⚠️  Detected ${aggregationResult.conflicts.length} conflicts`);
-      }
+      console.log(`📊 Decision based on ${validatedFindings.length} validated findings`);
       console.log(`✅ Decision: ${decision.decision}`);
       console.log(`💭 Rationale: ${decision.rationale}`);
 

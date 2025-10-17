@@ -43,25 +43,89 @@ export default class SubAgentOrchestrator {
       prompts.map(p => this.invokeAgent(p.agent, p.prompt))
     );
 
-    // Process results
+    // Process results - store raw findings for validation
+    const rawFindings = {};
     for (let i = 0; i < results.length; i++) {
       const result = results[i];
       const task = agentTasks[i];
 
       if (result.status === 'fulfilled') {
         const findings = this.parseFindings(result.value);
-        state.findings[task.category] = findings.findings || [];
+        rawFindings[`${task.category}Findings`] = findings.findings || [];
 
         console.log(`    ✓ ${task.agent}: ${findings.findings?.length || 0} findings`);
       } else {
         console.error(`    ✗ ${task.agent} failed: ${result.reason.message}`);
         state.addError('parallel_analysis', result.reason);
+        rawFindings[`${task.category}Findings`] = [];
       }
     }
+
+    // Run validation phase
+    console.log('  🔍 Running validation phase...');
+    const validatedResults = await this.runValidationPhase(rawFindings);
+
+    // Store consolidated findings
+    state.findings = validatedResults.findings || [];
+    state.validationStats = validatedResults.validationStats || {};
+
+    console.log(`    ✓ Validator: ${state.findings.length} consolidated findings`);
+    console.log(`      - Duplicates removed: ${state.validationStats.duplicatesRemoved || 0}`);
+    console.log(`      - False positives removed: ${state.validationStats.falsePositivesRemoved || 0}`);
 
     // Transition to synthesis phase
     state.transitionTo('synthesis');
     return state;
+  }
+
+  /**
+   * Run validation phase to consolidate findings using MECE principles
+   * @param {Object} rawFindings - Findings from all sub-agents
+   * @returns {Promise<Object>} Validated and consolidated findings
+   */
+  async runValidationPhase(rawFindings) {
+    // Build validation prompt
+    const prompt = `Consolidate and validate findings from all sub-agents:
+
+${JSON.stringify(rawFindings, null, 2)}
+
+Apply MECE (Mutually Exclusive, Collectively Exhaustive) principles to:
+1. Categorize findings into security, performance, testing, architecture, style
+2. Deduplicate findings (same file + line)
+3. Filter by confidence scores (critical always kept, major >= 0.7, minor >= 0.8)
+4. Remove false positives
+5. Validate severity levels
+
+Return consolidated findings in the JSON format specified in .claude/agents/validator.md`;
+
+    try {
+      // Invoke validator agent
+      const response = await this.invokeAgent('validator', prompt);
+      const validated = this.parseFindings(response);
+
+      return validated;
+    } catch (error) {
+      console.error('    ✗ Validation phase failed:', error.message);
+      console.error('    ⚠ Falling back to raw findings without validation');
+
+      // Fallback: return raw findings without validation
+      const fallbackFindings = [];
+      for (const [category, findings] of Object.entries(rawFindings)) {
+        fallbackFindings.push(...findings);
+      }
+
+      return {
+        findings: fallbackFindings,
+        validationStats: {
+          totalInputFindings: fallbackFindings.length,
+          duplicatesRemoved: 0,
+          lowConfidenceFiltered: 0,
+          falsePositivesRemoved: 0,
+          finalCount: fallbackFindings.length,
+          categoryCounts: {}
+        }
+      };
+    }
   }
 
   /**

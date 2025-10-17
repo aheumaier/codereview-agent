@@ -261,24 +261,128 @@ describe('MCP Utils Module', () => {
       expect(result).toEqual([]);
     });
 
-    it('should return empty array for invalid JSON', () => {
-      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+    it('should return error object for plain text response', () => {
+      const debugSpy = jest.spyOn(console, 'debug').mockImplementation();
 
       const response = {
         content: [{
-          text: 'invalid json'
+          text: 'missing required field'
         }]
       };
 
       const result = mcpUtils.parseMCPResponse(response);
 
-      expect(result).toEqual([]);
+      expect(result).toEqual({
+        error: 'missing required field',
+        isPlainText: true
+      });
+      expect(debugSpy).toHaveBeenCalledWith(
+        'MCP response appears to be plain text:',
+        'missing required field'
+      );
+
+      debugSpy.mockRestore();
+    });
+
+    it('should return error object for invalid JSON that looks like JSON', () => {
+      const consoleSpy = jest.spyOn(console, 'error').mockImplementation();
+
+      const response = {
+        content: [{
+          text: '{"invalid": json}'
+        }]
+      };
+
+      const result = mcpUtils.parseMCPResponse(response);
+
+      expect(result).toEqual({
+        error: expect.stringContaining('JSON parse failed:'),
+        originalText: '{"invalid": json}'
+      });
       expect(consoleSpy).toHaveBeenCalledWith(
-        'Failed to parse MCP response:',
-        expect.any(Error)
+        'Failed to parse MCP response as JSON:',
+        expect.objectContaining({
+          error: expect.any(String),
+          responsePreview: expect.any(String),
+          fullResponse: '{"invalid": json}'
+        })
       );
 
       consoleSpy.mockRestore();
+    });
+
+    it('should handle response with data field instead of text', () => {
+      const data = { id: 456, name: 'Test' };
+      const response = {
+        content: [{
+          data: data
+        }]
+      };
+
+      const result = mcpUtils.parseMCPResponse(response);
+
+      expect(result).toBe(data);
+    });
+  });
+
+  describe('parseMCPResponse with GitHub resource type', () => {
+    it('should extract file content from resource type', () => {
+      const response = {
+        content: [
+          { type: 'text', text: 'successfully downloaded text file' },
+          {
+            type: 'resource',
+            resource: {
+              uri: 'repo://owner/repo/contents/test.js',
+              mimeType: 'text/plain; charset=utf-8',
+              text: 'const foo = "bar";'
+            }
+          }
+        ]
+      };
+
+      const result = mcpUtils.parseMCPResponse(response);
+
+      expect(result.content).toBe('const foo = "bar";');
+      expect(result.uri).toBe('repo://owner/repo/contents/test.js');
+      expect(result.encoding).toBe('utf8');
+    });
+
+    it('should handle resource type without text field', () => {
+      const response = {
+        content: [
+          { type: 'text', text: 'successfully downloaded text file' },
+          {
+            type: 'resource',
+            resource: {
+              uri: 'repo://owner/repo/contents/empty.js',
+              mimeType: 'text/plain; charset=utf-8'
+              // No text field
+            }
+          }
+        ]
+      };
+
+      const result = mcpUtils.parseMCPResponse(response);
+
+      expect(result.content).toBe('');
+      expect(result.uri).toBe('repo://owner/repo/contents/empty.js');
+    });
+
+    it('should fall back to existing logic when no resource type found', () => {
+      // Test that GitLab responses still work
+      const response = {
+        content: [{
+          text: '{"id": 123, "title": "Test PR"}'
+        }]
+      };
+
+      const result = mcpUtils.parseMCPResponse(response);
+
+      expect(result).toEqual({
+        id: 123,
+        title: 'Test PR'
+      });
     });
   });
 

@@ -118,7 +118,23 @@ Configuration uses **environment variable substitution**:
 {
   "claude": {
     "apiKey": "${CLAUDE_API_KEY}",  // Replaced with process.env.CLAUDE_API_KEY
-    "model": "claude-sonnet-4-5-20250929"
+    "model": "claude-sonnet-4-5-20250929",
+    "tier": 1  // Claude API tier (1-4) for rate limiting
+  },
+  "review": {
+    "maxTokensPerPR": 50000,  // Token budget per PR
+    "adaptiveExecution": {
+      "enabled": true,
+      "thresholds": {
+        "smallFiles": 10,
+        "smallLOC": 500,
+        "mediumFiles": 30,
+        "mediumLOC": 2000,
+        "largeFiles": 100,
+        "largeLOC": 5000,
+        "complexityThreshold": 0.7
+      }
+    }
   }
 }
 ```
@@ -390,6 +406,155 @@ Configure thresholds in `conf/config.json`:
 4. **Log individual agent errors**: Don't let one failure hide others
 5. **Implement retry logic**: For transient API failures
 
+### Adaptive Execution Strategy
+
+The agent uses an adaptive execution strategy (`app/utils/adaptive-execution.js`) that selects the optimal review mode based on PR characteristics:
+
+**Execution Modes**:
+- `SEQUENTIAL`: Small PRs (<10 files, <500 LOC) - token efficiency prioritized
+- `PARALLEL`: Medium PRs with high complexity - faster reviews
+- `INCREMENTAL_BATCH`: Large PRs (30-100 files) - prevents context overflow
+- `REJECT_TOO_LARGE`: PRs exceeding thresholds - require splitting
+
+**Complexity Factors** (0-1 score):
+- Security-sensitive files (+0.3): auth, crypto, session, password
+- Architectural changes (+0.3): schema, migration, config, API routes
+- Breaking changes (+0.4): keywords in PR description
+- Low test coverage (+0.2): <30% test files
+- Large file changes (+0.1): >500 LOC in single file
+- Dependency changes (+0.2): package.json, requirements.txt, etc.
+
+**Usage**:
+```javascript
+import { AdaptiveExecutionStrategy, ExecutionMode } from './utils/adaptive-execution.js';
+
+const strategy = new AdaptiveExecutionStrategy(config);
+const decision = strategy.selectStrategy(pr);
+
+if (decision.mode === ExecutionMode.PARALLEL) {
+  // Run parallel review
+} else if (decision.mode === ExecutionMode.SEQUENTIAL) {
+  // Run sequential review
+}
+```
+
+### Rate Limiting & Token Management
+
+**Token Bucket Rate Limiter** (`app/utils/rate-limiter.js`):
+- Implements client-side token bucket algorithm matching Claude API behavior
+- Prevents 429 errors through proactive throttling
+- Tracks three metrics: RPM (requests/min), ITPM (input tokens/min), OTPM (output tokens/min)
+- Continuous refill model (not fixed windows)
+
+**Configuration by Claude API Tier**:
+```javascript
+const limits = {
+  1: { rpm: 50, itpm: 30000, otpm: 8000 },
+  2: { rpm: 100, itpm: 60000, otpm: 16000 },
+  3: { rpm: 300, itpm: 150000, otpm: 40000 },
+  4: { rpm: 500, itpm: 300000, otpm: 80000 }
+};
+```
+
+**Usage**:
+```javascript
+import { createRateLimiters } from './utils/rate-limiter.js';
+
+const { rpm, itpm, otpm } = createRateLimiters(config);
+
+// Acquire tokens before API call
+await itpm.acquire(estimatedInputTokens);
+await otpm.acquire(estimatedOutputTokens);
+await rpm.acquire(1);
+
+// Make API call
+const response = await anthropic.messages.create(...);
+```
+
+**Token Budget Manager** (`app/utils/token-budget-manager.js`):
+- Tracks token usage per PR and per agent
+- Enforces maximum token budget per review
+- Pre-flight checks with 20% safety margin
+- Provides detailed usage reports and agent breakdown
+
+**Usage**:
+```javascript
+import TokenBudgetManager from './utils/token-budget-manager.js';
+
+const budget = new TokenBudgetManager(50000); // 50k token limit
+
+// Wrap API calls
+const response = await budget.trackCall(
+  'security-analyzer',
+  () => anthropic.messages.create(...),
+  estimatedTokens
+);
+
+// Get usage report
+const report = budget.getReport();
+console.log(`Used ${report.percentUsed} of budget`);
+```
+
+### Validator Agent (MECE Consolidation)
+
+The validator agent (`.claude/agents/validator.md`) performs **Mutually Exclusive, Collectively Exhaustive** consolidation of findings from all sub-agents:
+
+**Key Responsibilities**:
+1. **MECE Categorization**: Ensures each finding belongs to exactly one category
+2. **Deduplication**: Merges findings for same file/line with semantic similarity
+3. **Confidence Validation**: Filters low-confidence findings (thresholds: critical=always keep, major>=0.7, minor>=0.8)
+4. **False Positive Filtering**: Removes SDK methods, config parameters, test mocks
+5. **Severity Validation**: Ensures accurate severity levels
+
+**Output Format**:
+```json
+{
+  "findings": [
+    {
+      "file": "path/to/file.js",
+      "line": 42,
+      "severity": "critical",
+      "category": "security",
+      "message": "Clear description",
+      "suggestion": "Specific fix",
+      "evidence": ["agent1: ...", "agent2: ..."],
+      "confidence": 0.95,
+      "sources": ["security-analyzer", "architecture-analyzer"]
+    }
+  ],
+  "validationStats": {
+    "totalInputFindings": 50,
+    "duplicatesRemoved": 15,
+    "lowConfidenceFiltered": 8,
+    "falsePositivesRemoved": 3,
+    "finalCount": 24
+  }
+}
+```
+
+### Code Churn Analysis (Utility Scripts)
+
+**Bash Churn Analysis** (`scripts/churn-analysis.sh`):
+```bash
+# Analyze file churn over time period
+./scripts/churn-analysis.sh --period "3 months" --threshold 5
+
+# Outputs files changed more than threshold times
+```
+
+**.NET Namespace Churn** (`scripts/dotnet-namespace-churn.py`):
+```bash
+# Analyze namespace-level churn for .NET projects
+python3 scripts/dotnet-namespace-churn.py --period "1 month" --threshold 1
+
+# Useful for identifying architectural hotspots
+```
+
+**Integration with Review Process**:
+- High churn files may indicate technical debt
+- Can trigger more thorough architectural reviews
+- Helps prioritize refactoring efforts
+
 ## Common Pitfalls
 
 1. **Memory Leak**: Always delete `_reviewNumber` and `_temperature` from review objects before returning
@@ -400,3 +565,9 @@ Configure thresholds in `conf/config.json`:
 6. **Agent Output Format**: Ensure all agents return valid JSON with required fields
 7. **State Corruption**: Always use atomic writes when saving state files
 8. **Feature Flag Caching**: Feature flags are evaluated per-PR, don't cache globally
+9. **Rate Limiter Sequence**: Always acquire rate limiter tokens BEFORE making API calls, not after
+10. **Token Budget Rollback**: Budget manager auto-rolls back on API call failures - don't manually adjust
+11. **Adaptive Strategy PR Format**: Ensure PR object has `files` array with `additions`/`deletions` for proper strategy selection
+12. **Validator Agent Confidence**: Don't blindly trust confidence scores - validator may adjust based on multiple agent consensus
+13. **Churn Analysis Path**: Run churn scripts from repository root, not from scripts directory
+14. **Budget Exceeded Errors**: Catch `TokenBudgetExceededError` separately from generic errors for graceful degradation
