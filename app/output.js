@@ -1,6 +1,13 @@
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { spawn } from 'child_process';
+import {
+  createConnectedGitLabClient,
+  createConnectedGitHubClient,
+  safeCloseClient,
+  parseMCPResponse
+} from './mcp-utils.js';
+import { retryWithBackoff, isRetryableError } from './utils/retry.js';
 
 /**
  * Output handler for posting review results
@@ -131,7 +138,7 @@ class Output {
           params: {
             name: 'mcp__gitlab__create_note',
             arguments: {
-              project_id: pr.project_id,
+              project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
               noteable_type: 'merge_request',
               noteable_iid: pr.iid || pr.id,
               body: this.formatSummary(review)
@@ -151,7 +158,7 @@ class Output {
               params: {
                 name: 'mcp__gitlab__create_merge_request_thread',
                 arguments: {
-                  project_id: pr.project_id,
+                  project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
                   merge_request_iid: pr.iid || pr.id,
                   body: this.formatComment(comment),
                   position: {
@@ -173,7 +180,7 @@ class Output {
               params: {
                 name: 'mcp__gitlab__create_note',
                 arguments: {
-                  project_id: pr.project_id,
+                  project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
                   noteable_type: 'merge_request',
                   noteable_iid: pr.iid || pr.id,
                   body: this.formatComment(comment)
@@ -195,7 +202,7 @@ class Output {
           params: {
             name: 'mcp__gitlab__approve_merge_request',
             arguments: {
-              project_id: pr.project_id,
+              project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
               merge_request_iid: pr.iid || pr.id
             }
           }
@@ -216,17 +223,214 @@ class Output {
   }
 
   /**
-   * Post review to GitHub PR (stub)
+   * Post review to GitHub PR via MCP
    * @param {Object} pr - Pull request object
    * @param {Object} review - Review results
    * @param {Object} config - Configuration
    * @returns {Promise<Object>} Posting result
    */
   async postGitHubReview(pr, review, config) {
-    return {
-      posted: false,
-      error: 'GitHub output not implemented'
-    };
+    const platformConfig = config.platforms.github;
+    if (!platformConfig?.token) {
+      return {
+        posted: false,
+        error: 'GitHub token not configured'
+      };
+    }
+
+    // Parse owner/repo from PR data
+    const owner = pr.owner || pr.repository?.split('/')[0];
+    const repo = pr.repo || pr.repository?.split('/')[1];
+
+    if (!owner || !repo) {
+      return {
+        posted: false,
+        error: `Invalid repository format: ${pr.repository}`
+      };
+    }
+
+    let client, transport;
+
+    try {
+      // Create MCP client using shared utility for consistency
+      const connection = await createConnectedGitHubClient({
+        token: platformConfig.token,
+        repositories: platformConfig.repositories || []
+      });
+      client = connection.client;
+      transport = connection.transport;
+
+      let postedCount = 0;
+      let reviewId = null;
+
+      // GitHub review workflow:
+      // 1. Create a pending review
+      // 2. Add comments to the pending review
+      // 3. Submit the review with a decision
+
+      // Step 1: Create pending review
+      const createReviewResponse = await retryWithBackoff(
+        async () => client.callTool({
+          name: 'create_pending_pull_request_review',
+          arguments: {
+            owner,
+            repo,
+            pullNumber: parseInt(pr.id || pr.number),
+            commitId: pr.head_sha,
+            body: this.formatSummary(review)
+          }
+        }),
+        {
+          maxRetries: 3,
+          initialDelay: 1000,
+          shouldRetry: isRetryableError,
+          onRetry: (error, attempt, delay) => {
+            console.log(`  Retrying GitHub review creation (attempt ${attempt}/3) after ${delay}ms: ${error.message}`);
+          }
+        }
+      );
+
+      const reviewData = parseMCPResponse(createReviewResponse);
+      reviewId = reviewData.id;
+
+      // Step 2: Add inline comments to pending review
+      if (config.output.postComments !== false && review.comments?.length > 0) {
+        for (const comment of review.comments) {
+          if (comment.file && comment.line) {
+            try {
+              await retryWithBackoff(
+                async () => client.callTool({
+                  name: 'add_pull_request_review_comment_to_pending_review',
+                  arguments: {
+                    owner,
+                    repo,
+                    pullNumber: parseInt(pr.id || pr.number),
+                    reviewId: reviewId,
+                    body: this.formatComment(comment),
+                    path: comment.file,
+                    line: comment.line,
+                    side: 'RIGHT' // Comments on the new version of the file
+                  }
+                }),
+                {
+                  maxRetries: 2,
+                  initialDelay: 500,
+                  shouldRetry: isRetryableError
+                }
+              );
+              postedCount++;
+            } catch (error) {
+              console.warn(`Failed to add comment to ${comment.file}:${comment.line}: ${error.message}`);
+            }
+          }
+        }
+      }
+
+      // Step 3: Submit the review with decision
+      const githubEvent = this.mapDecisionToGitHubEvent(review.decision);
+
+      await retryWithBackoff(
+        async () => client.callTool({
+          name: 'submit_pending_pull_request_review',
+          arguments: {
+            owner,
+            repo,
+            pullNumber: parseInt(pr.id || pr.number),
+            reviewId: reviewId,
+            event: githubEvent,
+            body: this.formatReviewConclusion(review)
+          }
+        }),
+        {
+          maxRetries: 3,
+          initialDelay: 1000,
+          shouldRetry: isRetryableError,
+          onRetry: (error, attempt, delay) => {
+            console.log(`  Retrying GitHub review submission (attempt ${attempt}/3) after ${delay}ms: ${error.message}`);
+          }
+        }
+      );
+
+      // Optional: Post summary as issue comment if configured
+      if (config.output.postSummary !== false && config.output.postSummaryAsComment) {
+        await retryWithBackoff(
+          async () => client.callTool({
+            name: 'add_issue_comment',
+            arguments: {
+              owner,
+              repo,
+              issueNumber: parseInt(pr.id || pr.number),
+              body: this.formatSummary(review)
+            }
+          }),
+          {
+            maxRetries: 2,
+            initialDelay: 500,
+            shouldRetry: isRetryableError
+          }
+        );
+      }
+
+      return {
+        posted: true,
+        count: postedCount + 1, // +1 for the review itself
+        decision: review.decision,
+        reviewId
+      };
+
+    } catch (error) {
+      console.error('Failed to post GitHub review:', error);
+      return {
+        posted: false,
+        error: `Failed to post GitHub review: ${error.message}`
+      };
+    } finally {
+      await safeCloseClient(client, 'GitHub output');
+      // Close transport if it exists
+      if (transport) {
+        try {
+          await transport.close();
+        } catch (e) {
+          console.warn('Failed to close GitHub transport:', e.message);
+        }
+      }
+    }
+  }
+
+  /**
+   * Map review decision to GitHub review event
+   * @param {string} decision - Review decision
+   * @returns {string} GitHub review event type
+   */
+  mapDecisionToGitHubEvent(decision) {
+    switch (decision) {
+      case 'approved':
+        return 'APPROVE';
+      case 'changes_requested':
+      case 'needs_work':
+        return 'REQUEST_CHANGES';
+      default:
+        return 'COMMENT'; // Neutral comment
+    }
+  }
+
+  /**
+   * Format review conclusion message
+   * @param {Object} review - Review results
+   * @returns {string} Formatted conclusion
+   */
+  formatReviewConclusion(review) {
+    const totalIssues = (review.issues?.critical || 0) +
+                        (review.issues?.major || 0) +
+                        (review.issues?.minor || 0);
+
+    if (review.decision === 'approved') {
+      return '✅ This PR looks good to me! No blocking issues found.';
+    } else if (review.decision === 'changes_requested' || review.decision === 'needs_work') {
+      return `⚠️ Found ${totalIssues} issue${totalIssues !== 1 ? 's' : ''} that should be addressed before merging.`;
+    } else {
+      return `📝 Review complete. Found ${totalIssues} issue${totalIssues !== 1 ? 's' : ''} for consideration.`;
+    }
   }
 
   /**
@@ -319,4 +523,4 @@ class Output {
   }
 }
 
-export default new Output();
+export default Output;

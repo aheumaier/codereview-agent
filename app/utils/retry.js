@@ -71,6 +71,11 @@ export function isRetryableError(error) {
     return true;
   }
 
+  // Also check error.status (some libraries use this)
+  if (error.status && RETRYABLE_HTTP_STATUSES.has(error.status)) {
+    return true;
+  }
+
   // Check PlatformError status codes
   if (error instanceof PlatformError && error.statusCode) {
     return RETRYABLE_HTTP_STATUSES.has(error.statusCode);
@@ -132,6 +137,43 @@ export function calculateDelay(attempt, options = {}) {
 }
 
 /**
+ * Extract retry-after header value
+ * @param {Error} error - Error object that may contain headers
+ * @returns {number|null} Delay in milliseconds, or null if not found
+ */
+export function extractRetryAfter(error) {
+  // Check various header locations
+  const headers = error.headers || error.response?.headers;
+  if (!headers) return null;
+
+  // Get retry-after value (case-insensitive)
+  let retryAfter;
+  if (typeof headers.get === 'function') {
+    retryAfter = headers.get('retry-after');
+  } else if (typeof headers === 'object') {
+    retryAfter = headers['retry-after'] || headers['Retry-After'] || headers['RETRY-AFTER'];
+  }
+
+  if (!retryAfter) return null;
+
+  // Parse as seconds and convert to milliseconds
+  const seconds = parseInt(retryAfter, 10);
+  if (!isNaN(seconds) && seconds > 0) {
+    return seconds * 1000;
+  }
+
+  // Could be a date string (HTTP-date format)
+  const retryDate = new Date(retryAfter);
+  if (!isNaN(retryDate.getTime())) {
+    const now = Date.now();
+    const delay = retryDate.getTime() - now;
+    return delay > 0 ? delay : null;
+  }
+
+  return null;
+}
+
+/**
  * Sleep for specified milliseconds
  * @param {number} ms - Milliseconds to sleep
  * @returns {Promise<void>} Promise that resolves after delay
@@ -188,8 +230,19 @@ export async function retryWithBackoff(fn, options = {}) {
         throw error;
       }
 
-      // Calculate delay with exponential backoff and jitter
-      const delay = calculateDelay(attempt, config);
+      // Handle 429 with retry-after header (NEW)
+      const retryAfterDelay = extractRetryAfter(error);
+      let delay;
+
+      if (retryAfterDelay !== null) {
+        // Use retry-after header value
+        delay = retryAfterDelay;
+        console.log(`[Retry] Rate limited. Waiting ${delay}ms (from retry-after header)`);
+      } else {
+        // Calculate delay with exponential backoff and jitter
+        delay = calculateDelay(attempt, config);
+        console.debug(`[Retry] Attempt ${attempt + 1}/${config.maxRetries + 1} after ${delay.toFixed(0)}ms`);
+      }
 
       // Call onRetry callback if provided
       if (config.onRetry) {
@@ -206,114 +259,33 @@ export async function retryWithBackoff(fn, options = {}) {
 }
 
 /**
- * Circuit breaker implementation to prevent cascading failures
- * Optional enhancement - tracks failure rates and opens circuit when threshold exceeded
+ * Enhanced retry wrapper with full jitter and retry-after support
+ * Backward compatible with existing withRetry usage
+ * @param {Function} fn - Async function to retry
+ * @param {Object} options - Retry configuration options
+ * @returns {Promise<any>} Result of successful function call
+ * @throws {Error} Last error if all retries exhausted
  */
-export class CircuitBreaker {
-  constructor(options = {}) {
-    this.threshold = options.threshold || 0.5; // 50% failure rate
-    this.windowSize = options.windowSize || 10; // Track last 10 calls
-    this.cooldownPeriod = options.cooldownPeriod || 60000; // 60 seconds
-    this.state = 'closed'; // closed, open, half-open
-    this.failures = 0;
-    this.successes = 0;
-    this.lastFailureTime = null;
-    this.callHistory = [];
-  }
+export async function withRetry(fn, options = {}) {
+  const {
+    maxRetries = 5,
+    baseDelay = 1000,
+    maxDelay = 60000,
+    jitterPercent = 0.1,
+    shouldRetry = isRetryableError
+  } = options;
 
-  /**
-   * Execute function with circuit breaker protection
-   * @param {Function} fn - Function to execute
-   * @returns {Promise<any>} Function result
-   */
-  async execute(fn) {
-    // Check if circuit should be half-open
-    if (this.state === 'open') {
-      const timeSinceFailure = Date.now() - this.lastFailureTime;
-      if (timeSinceFailure >= this.cooldownPeriod) {
-        this.state = 'half-open';
-      } else {
-        throw new Error('Circuit breaker is open - service unavailable');
-      }
-    }
-
-    try {
-      const result = await fn();
-      this.recordSuccess();
-      return result;
-    } catch (error) {
-      this.recordFailure();
-      throw error;
-    }
-  }
-
-  /**
-   * Record successful call
-   */
-  recordSuccess() {
-    this.callHistory.push(true);
-    if (this.callHistory.length > this.windowSize) {
-      this.callHistory.shift();
-    }
-
-    if (this.state === 'half-open') {
-      this.state = 'closed';
-      this.failures = 0;
-    }
-  }
-
-  /**
-   * Record failed call
-   */
-  recordFailure() {
-    this.callHistory.push(false);
-    if (this.callHistory.length > this.windowSize) {
-      this.callHistory.shift();
-    }
-
-    this.lastFailureTime = Date.now();
-
-    // Calculate failure rate
-    const failureCount = this.callHistory.filter(success => !success).length;
-    const failureRate = failureCount / this.callHistory.length;
-
-    if (failureRate >= this.threshold) {
-      this.state = 'open';
-    }
-  }
-
-  /**
-   * Get current circuit breaker state
-   * @returns {string} Current state
-   */
-  getState() {
-    return this.state;
-  }
-
-  /**
-   * Reset circuit breaker to initial state
-   */
-  reset() {
-    this.state = 'closed';
-    this.failures = 0;
-    this.successes = 0;
-    this.lastFailureTime = null;
-    this.callHistory = [];
-  }
-}
-
-/**
- * Create a wrapped function with built-in retry logic
- * Factory pattern for creating retry-enabled functions
- * @param {Function} fn - Function to wrap
- * @param {Object} options - Retry options
- * @returns {Function} Wrapped function with retry logic
- */
-export function withRetry(fn, options = {}) {
-  return async function retryWrapper(...args) {
-    return retryWithBackoff(
-      async () => fn(...args),
-      options
-    );
+  // Map to retryWithBackoff config format
+  const backoffConfig = {
+    maxRetries,
+    initialDelay: baseDelay,
+    maxDelay,
+    jitterFactor: jitterPercent,
+    shouldRetry,
+    backoffMultiplier: 2,
+    onRetry: options.onRetry
   };
+
+  return retryWithBackoff(fn, backoffConfig);
 }
+

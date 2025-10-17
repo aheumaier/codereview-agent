@@ -39,7 +39,7 @@ build/
 # IDE and Editor files
 .vscode/
 .idea/
-.claude/
+.claude/settings.local.json
 *.swp
 *.swo
 *~

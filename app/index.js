@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 
 import { loadConfig, validateConfig } from './config.js';
-import tracker from './tracker.js';
-import discovery from './discovery.js';
-import context from './context.js';
-import review from './review.js';
-import output from './output.js';
+import Tracker from './tracker.js';
+import Discovery from './discovery.js';
+import Context from './context.js';
+import Review from './review.js';
+import Output from './output.js';
+import StateManager from './state/StateManager.js';
+import FeatureFlags from './utils/featureFlags.js';
+import FindingAggregator from './synthesis/FindingAggregator.js';
+import DecisionMatrix from './synthesis/DecisionMatrix.js';
 import {
   ConfigurationError,
   PlatformError,
@@ -18,6 +22,219 @@ import { isNonEmptyString, isValidDate } from './utils/validators.js';
  * Main orchestrator for the code review agent
  */
 class CodeReviewAgent {
+  /**
+   * Run state-managed review flow
+   * @param {ReviewState} state - Review state object
+   * @param {Object} config - Configuration
+   * @param {FeatureFlags} featureFlags - Feature flags
+   */
+  async runStateManagedReview(state, config, featureFlags) {
+    const context = new Context();
+    const review = new Review();
+    const output = new Output();
+
+    try {
+      // Gather context
+      console.log('📦 Gathering context...');
+      await this.gatherContext(state, config, context);
+
+      // Check if sub-agents enabled
+      let reviewResult;
+      if (featureFlags.isEnabled('useSubAgents')) {
+        // Phase 1: Parallel Analysis
+        state.transitionTo('parallel_analysis');
+        console.log('🔄 Phase 1: Parallel sub-agent analysis...');
+
+        const SubAgentOrchestrator = (await import('./agents/SubAgentOrchestrator.js')).default;
+        const orchestrator = new SubAgentOrchestrator(config);
+
+        // Run parallel analysis with validation phase
+        // SubAgentOrchestrator now handles:
+        // 1. Parallel sub-agent execution
+        // 2. Validation/consolidation phase (MECE)
+        // 3. Returns validated findings in state.findings (array)
+        await orchestrator.executeParallelAnalysis(state, config);
+
+        // Phase 2: Already completed by validator agent
+        console.log('✅ Phase 2: Validation complete');
+        console.log(`   - Total findings: ${state.findings.length}`);
+        console.log(`   - Duplicates removed: ${state.validationStats?.duplicatesRemoved || 0}`);
+        console.log(`   - False positives removed: ${state.validationStats?.falsePositivesRemoved || 0}`);
+
+        // Create reviewResult from validated findings
+        reviewResult = {
+          decision: state.findings.some(f => f.severity === 'critical') ? 'changes_requested' : 'approved',
+          summary: `Analysis complete: ${state.findings.length} validated findings`,
+          comments: state.findings,
+          validationStats: state.validationStats
+        };
+      }
+
+      // Phase 3: Synthesis (Decision Making)
+      state.transitionTo('synthesis');
+      console.log('🔄 Phase 3: Making decision...');
+
+      // Findings are already validated and deduplicated by validator agent
+      // No need for additional aggregation - just make decision
+      const decisionMatrix = new DecisionMatrix();
+
+      // Collect metrics from state
+      const metrics = this.collectMetrics(state);
+
+      // Make decision based on validated findings
+      const validatedFindings = state.findings || [];
+      const decision = decisionMatrix.decide(validatedFindings, metrics);
+
+      // Update state with synthesis results
+      state.synthesis = {
+        aggregated: validatedFindings,
+        conflicts: [], // Validator already resolved conflicts
+        decision: decision.decision,
+        rationale: decision.rationale,
+        metadata: {
+          total_findings: decision.total_findings,
+          critical_count: decision.critical_count,
+          major_count: decision.major_count,
+          minor_count: decision.minor_count,
+          coverage_delta: decision.coverage_delta
+        }
+      };
+
+      // Log synthesis results
+      console.log(`📊 Decision based on ${validatedFindings.length} validated findings`);
+      console.log(`✅ Decision: ${decision.decision}`);
+      console.log(`💭 Rationale: ${decision.rationale}`);
+
+      // Transition to output
+      state.transitionTo('output');
+      console.log('📮 Generating output...');
+
+      // Generate output
+      state.output = {
+        comments: reviewResult.comments || [],
+        summary: reviewResult.summary,
+        status: 'success'
+      };
+
+      // Post review
+      const pr = {
+        id: state.prId,
+        platform: state.platform,
+        project_id: state.repository,
+        repository: state.repository,
+        ...state.context.metadata
+      };
+
+      const postResult = await output.postReview(pr, reviewResult, config);
+      console.log(postResult.dryRun ? '🔸 DRY RUN - Review not posted' : '✅ Review posted');
+
+      return { success: true, state };
+
+    } catch (error) {
+      state.addError(state.phase, error);
+      throw error;
+    }
+  }
+
+  /**
+   * Gather context and populate state
+   * @param {ReviewState} state - Review state
+   * @param {Object} config - Configuration
+   * @param {Context} context - Context builder
+   */
+  async gatherContext(state, config, context) {
+    const pr = {
+      id: state.prId,
+      iid: state.iid,  // GitLab internal ID
+      platform: state.platform,
+      project_path: state.repository,  // Use path format for MCP calls
+      project_id: state.repository,
+      repository: state.repository,
+      source_branch: state.branch,
+      target_branch: state.baseBranch
+    };
+
+    const prContext = await context.buildContext(pr, config);
+
+    if (prContext.error) {
+      throw new Error(`Context error: ${prContext.error}`);
+    }
+
+    // Populate state with context
+    state.context = {
+      metadata: {
+        title: prContext.title || pr.id,
+        author: prContext.author,
+        description: prContext.description
+      },
+      repository: {
+        language: prContext.language,
+        dependencies: prContext.dependencies
+      },
+      diff: {
+        additions: prContext.stats?.additions || 0,
+        deletions: prContext.stats?.deletions || 0,
+        files: prContext.diff || []  // Use prContext.diff (actual code diffs), not prContext.files (metadata)
+      },
+      stats: {
+        coverage: prContext.coverage,
+        complexity: prContext.complexity,
+        filesChanged: prContext.stats?.filesChanged || 0
+      }
+    };
+  }
+
+  /**
+   * Collect metrics from state for decision making
+   * @param {ReviewState} state - Review state
+   * @returns {Object} Metrics object
+   */
+  collectMetrics(state) {
+    const metrics = {
+      coverage_delta: 0,
+      complexity_increase: 0,
+      files_changed: state.context?.stats?.filesChanged || 0
+    };
+
+    // Calculate coverage delta if available
+    if (state.context?.stats?.coverage) {
+      const coverage = state.context.stats.coverage;
+      if (coverage.before !== undefined && coverage.after !== undefined) {
+        metrics.coverage_delta = coverage.after - coverage.before;
+      } else if (coverage.delta !== undefined) {
+        metrics.coverage_delta = coverage.delta;
+      }
+    }
+
+    // Collect metrics from sub-agent findings if available
+    if (state.findings) {
+      // Test metrics
+      const testFindings = state.findings.test || [];
+      const coverageFindings = testFindings.filter(f =>
+        f.message && f.message.toLowerCase().includes('coverage')
+      );
+      if (coverageFindings.length > 0) {
+        // Extract coverage delta from findings if not already set
+        coverageFindings.forEach(finding => {
+          const match = finding.message.match(/decreased by ([\d.]+)%/);
+          if (match && !metrics.coverage_delta) {
+            metrics.coverage_delta = -parseFloat(match[1]);
+          }
+        });
+      }
+
+      // Performance metrics
+      const perfFindings = state.findings.performance || [];
+      const complexityFindings = perfFindings.filter(f =>
+        f.message && f.message.toLowerCase().includes('complexity')
+      );
+      metrics.complexity_issues = complexityFindings.length;
+    }
+
+    return metrics;
+  }
+
+
   /**
    * Validate PR object has required fields
    * @param {Object} pr - Pull request object to validate
@@ -71,11 +288,34 @@ class CodeReviewAgent {
   async run() {
     console.log('🤖 Code Review Agent Starting...\n');
 
+    let tracker; // Define tracker here for finally block access
+    let stateManager; // State manager for new flow
+
     try {
       // Load and validate configuration
       console.log('📋 Loading configuration...');
       const config = await loadConfig();
       validateConfig(config);
+
+      // Initialize feature flags
+      const featureFlags = FeatureFlags.fromConfig(config);
+
+      if (featureFlags.isEnabled('useStateManagement')) {
+        console.log('🔧 State management enabled');
+      } else {
+        console.log('🔧 Legacy mode enabled');
+      }
+
+      // Instantiate dependencies
+      tracker = new Tracker();
+      const discovery = new Discovery();
+
+      // Initialize state manager if feature is enabled
+      if (featureFlags.isEnabled('useStateManagement')) {
+        stateManager = new StateManager(config.tracking.dbPath);
+        await stateManager.initialize();
+        console.log('📊 State manager initialized');
+      }
 
       // Initialize tracker
       console.log('🗄️ Initializing review tracker...');
@@ -119,81 +359,43 @@ class CodeReviewAgent {
             continue;
           }
 
-          // Check if already reviewed (skip this check in dry-run mode)
-          const isDryRun = config.output.dryRun === true || config.output.dryRun === 'true';
+          // Choose review flow based on feature flag
+          if (featureFlags.isEnabled('useStateManagement')) {
+            // State-managed flow
+            console.log('🔄 Using state-managed review flow');
 
-          if (!isDryRun) {
-            const alreadyReviewed = await tracker.hasReviewed(
-              pr.platform,
-              pr.project_id || pr.repository,
+            // Try to load existing state or create new
+            let state = await stateManager.loadState(
               pr.id,
-              pr.updated_at
+              pr.platform,
+              pr.project_path || pr.project_id || pr.repository
             );
 
-            if (alreadyReviewed) {
-              console.log('⏭️  Already reviewed, skipping...');
-              skipped++;
-              continue;
+            if (!state) {
+              state = await stateManager.createState(
+                pr.id,
+                pr.platform,
+                pr.project_path || pr.project_id || pr.repository,
+                pr.source_branch,
+                pr.target_branch,
+                pr.iid  // GitLab internal ID
+              );
+            } else {
+              console.log(`   Resuming from phase: ${state.phase}`);
             }
-          } else {
-            console.log('🔸 DRY RUN MODE - Ignoring review history');
+
+            // Run state-managed review
+            const result = await this.runStateManagedReview(state, config, featureFlags);
+
+            // Save final state
+            await stateManager.saveState(state);
+
+            if (result.success) {
+              reviewed++;
+            } else {
+              errors++;
+            }
           }
-
-          // Build context
-          console.log('📦 Building context...');
-          const prContext = await context.buildContext(pr, config);
-
-          if (prContext.error) {
-            console.error(`❌ Context error: ${prContext.error}`);
-            errors++;
-            continue;
-          }
-
-          console.log(`   Files: ${prContext.stats.filesChanged}`);
-          console.log(`   Changes: +${prContext.stats.additions} -${prContext.stats.deletions}`);
-
-          // Perform review
-          console.log('🧠 Analyzing with Claude...');
-          const reviewResult = await review.reviewPR(prContext, config);
-
-          if (reviewResult.error) {
-            console.error(`❌ Review error: ${reviewResult.error}`);
-            errors++;
-            continue;
-          }
-
-          console.log(`   Decision: ${reviewResult.decision}`);
-          console.log(`   Issues: ${reviewResult.comments?.length || 0}`);
-
-          // Post review
-          console.log('📮 Posting review...');
-          const postResult = await output.postReview(pr, reviewResult, config);
-
-          if (postResult.dryRun) {
-            console.log('🔸 DRY RUN - Review not posted');
-          } else if (postResult.posted) {
-            console.log('✅ Review posted successfully');
-          } else {
-            console.error(`❌ Failed to post: ${postResult.error}`);
-            errors++;
-            continue;
-          }
-
-          // Mark as reviewed (skip in dry-run mode to avoid polluting history)
-          if (!isDryRun) {
-            await tracker.markReviewed({
-              platform: pr.platform,
-              repository: pr.project_id || pr.repository,
-              prId: pr.id,
-              sha: pr.sha || pr.head_sha,
-              summary: reviewResult.summary,
-              decision: reviewResult.decision,
-              comments: reviewResult.comments,
-              prUpdatedAt: pr.updated_at
-            });
-          }
-
-          reviewed++;
 
         } catch (error) {
           console.error(`❌ Unexpected error: ${error.message}`);
@@ -245,10 +447,19 @@ class CodeReviewAgent {
       process.exit(1);
     } finally {
       // Clean up
-      try {
-        await tracker.close();
-      } catch (error) {
-        console.error('Failed to close tracker:', error);
+      if (tracker) {
+        try {
+          await tracker.close();
+        } catch (error) {
+          console.error('Failed to close tracker:', error);
+        }
+      }
+      if (stateManager) {
+        try {
+          await stateManager.close();
+        } catch (error) {
+          console.error('Failed to close state manager:', error);
+        }
       }
     }
 

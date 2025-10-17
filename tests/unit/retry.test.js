@@ -12,12 +12,13 @@ import {
 } from '../../app/utils/retry.js';
 import { PlatformError, MCPError } from '../../app/utils/errorHelpers.js';
 
-// Mock setTimeout for faster tests
-jest.useFakeTimers();
-
 describe('Retry Utility', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+
   afterEach(() => {
-    jest.clearAllTimers();
+    jest.useRealTimers();
   });
 
   describe('isRetryableError', () => {
@@ -230,21 +231,26 @@ describe('Retry Utility', () => {
     });
 
     it('should throw last error when max retries exhausted', async () => {
-      const error = new Error('Persistent network error');
-      error.code = 'ECONNRESET';
-      const mockFn = jest.fn().mockRejectedValue(error);
+      // Use real timers for this test to avoid async issues
+      jest.useRealTimers();
+
+      const testError = { statusCode: 500, message: 'Server error' };
+      const mockFn = jest.fn().mockRejectedValue(testError);
 
       const promise = retryWithBackoff(mockFn, {
         maxRetries: 2,
-        initialDelay: 100,
+        initialDelay: 10,  // Short delay for real timers
         jitterFactor: 0
       });
 
-      // Run all timers to completion
-      await jest.runAllTimersAsync();
+      // Wait for the promise to resolve/reject
+      await expect(promise).rejects.toEqual(testError);
 
-      await expect(promise).rejects.toEqual(error);
+      // Verify function was called expected number of times
       expect(mockFn).toHaveBeenCalledTimes(3); // Initial + 2 retries
+
+      // Restore fake timers for other tests
+      jest.useFakeTimers();
     });
 
     it('should use custom shouldRetry predicate', async () => {

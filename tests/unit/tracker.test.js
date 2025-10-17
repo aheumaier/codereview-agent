@@ -1,6 +1,7 @@
 import { jest } from '@jest/globals';
 import sqlite3 from 'sqlite3';
 import { open } from 'sqlite';
+import Tracker from '../../app/tracker.js';
 
 // Mock the database
 jest.mock('sqlite', () => ({
@@ -11,8 +12,8 @@ describe('Tracker Module', () => {
   let tracker;
   let mockDb;
 
-  beforeEach(async () => {
-    jest.resetModules();
+  beforeEach(() => {
+    jest.clearAllMocks();
 
     // Create mock database
     mockDb = {
@@ -25,8 +26,8 @@ describe('Tracker Module', () => {
 
     open.mockResolvedValue(mockDb);
 
-    const trackerModule = await import('../../app/tracker.js');
-    tracker = trackerModule.default;
+    // Create fresh instance
+    tracker = new Tracker();
   });
 
   afterEach(() => {
@@ -63,8 +64,8 @@ describe('Tracker Module', () => {
 
       expect(result).toBe(true);
       expect(mockDb.get).toHaveBeenCalledWith(
-        expect.stringContaining('SELECT COUNT(*) as count FROM reviews'),
-        { platform: 'gitlab', repository: 'project/repo', pr_id: '123' }
+        expect.stringContaining('SELECT COUNT(*) as count'),
+        ['gitlab', 'project/repo', '123']
       );
     });
 
@@ -78,7 +79,7 @@ describe('Tracker Module', () => {
     });
 
     it('should handle updated PRs', async () => {
-      mockDb.get.mockResolvedValue({ count: 1, updated_at: '2024-01-01T00:00:00Z' });
+      mockDb.get.mockResolvedValue({ count: 1, reviewed_at: '2024-01-01T00:00:00Z' });
 
       await tracker.initialize('./test.db');
       const prUpdatedAt = '2024-01-02T00:00:00Z';
@@ -107,11 +108,11 @@ describe('Tracker Module', () => {
 
       expect(mockDb.run).toHaveBeenCalledWith(
         expect.stringContaining('INSERT OR REPLACE INTO reviews'),
-        expect.objectContaining({
-          platform: 'gitlab',
-          repository: 'project/repo',
-          pr_id: '123'
-        })
+        expect.arrayContaining([
+          'gitlab',
+          'project/repo',
+          '123'
+        ])
       );
     });
 
@@ -142,7 +143,7 @@ describe('Tracker Module', () => {
       expect(history).toEqual(mockHistory);
       expect(mockDb.all).toHaveBeenCalledWith(
         expect.stringContaining('SELECT * FROM reviews'),
-        { platform: 'gitlab', repository: 'project/repo', pr_id: '123' }
+        ['gitlab', 'project/repo', '123']
       );
     });
 
@@ -165,8 +166,8 @@ describe('Tracker Module', () => {
 
       expect(deleted).toBe(5);
       expect(mockDb.run).toHaveBeenCalledWith(
-        expect.stringContaining('DELETE FROM reviews WHERE'),
-        expect.any(Object)
+        expect.stringContaining('DELETE FROM reviews'),
+        [30]
       );
     });
   });

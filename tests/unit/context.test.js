@@ -1,8 +1,10 @@
 import { jest } from '@jest/globals';
+import Context from '../../app/context.js';
 
 // Mock MCP utils module
 jest.mock('../../app/mcp-utils.js', () => ({
   createConnectedGitLabClient: jest.fn(),
+  createConnectedGitHubClient: jest.fn(),
   safeCloseClient: jest.fn(),
   parseMCPResponse: jest.fn()
 }));
@@ -13,7 +15,6 @@ describe('Context Module', () => {
   let mcpUtils;
 
   beforeEach(async () => {
-    jest.resetModules();
     jest.clearAllMocks();
 
     // Get the mocked utils
@@ -21,7 +22,8 @@ describe('Context Module', () => {
 
     // Setup mock client
     mockClient = {
-      request: jest.fn()
+      request: jest.fn(),
+      callTool: jest.fn()
     };
 
     mcpUtils.createConnectedGitLabClient.mockResolvedValue(mockClient);
@@ -31,8 +33,8 @@ describe('Context Module', () => {
       return typeof text === 'string' ? JSON.parse(text) : text;
     });
 
-    const contextModule = await import('../../app/context.js');
-    context = contextModule.default;
+    // Create fresh instance
+    context = new Context();
   });
 
   afterEach(() => {
@@ -75,7 +77,7 @@ describe('Context Module', () => {
         }
       ];
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -106,7 +108,7 @@ describe('Context Module', () => {
         }
       ];
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -137,7 +139,7 @@ describe('Context Module', () => {
         content: '{"name": "test", "version": "1.0.0"}'
       };
 
-      mockClient.request
+      mockClient.callTool
         .mockResolvedValueOnce({ // Diff request
           content: [{
             type: 'text',
@@ -168,7 +170,7 @@ describe('Context Module', () => {
         diff: '@@ -1,1 +1,1 @@\n-old\n+new'
       }));
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -182,7 +184,7 @@ describe('Context Module', () => {
     });
 
     it('should handle MCP errors gracefully', async () => {
-      mockClient.request.mockRejectedValue(new Error('MCP error'));
+      mockClient.callTool.mockRejectedValue(new Error('MCP error'));
 
       const prContext = await context.buildContext(mockPR, mockConfig);
 
@@ -196,7 +198,7 @@ describe('Context Module', () => {
           deletions: 0,
           totalLines: 0
         },
-        error: 'Failed to get PR context'
+        error: 'Failed to get PR context: MCP error'
       });
     });
 
@@ -216,7 +218,7 @@ describe('Context Module', () => {
         }
       ];
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -253,7 +255,7 @@ describe('Context Module', () => {
         }
       };
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify([])
@@ -295,7 +297,7 @@ describe('Context Module', () => {
         }
       };
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify([])
@@ -304,11 +306,12 @@ describe('Context Module', () => {
 
       await context.buildContext(pr, config);
 
-      expect(mockClient.request).toHaveBeenCalledWith(
+      expect(mockClient.callTool).toHaveBeenCalledWith(
         expect.objectContaining({
-          method: 'tools/call',
-          params: expect.objectContaining({
-            name: expect.stringContaining('get_merge_request_diffs')
+          name: 'get_merge_request_diffs',
+          arguments: expect.objectContaining({
+            project_id: 'project/repo',
+            merge_request_iid: '10'
           })
         })
       );
@@ -377,7 +380,7 @@ describe('Context Module', () => {
         }
       ];
 
-      mockClient.request.mockResolvedValue({
+      mockClient.callTool.mockResolvedValue({
         content: [{
           type: 'text',
           text: JSON.stringify(mockDiff)
@@ -408,6 +411,216 @@ describe('Context Module', () => {
       expect(fileTypes).toContain('config');
       expect(fileTypes).toContain('sensitive');
       expect(fileTypes).toContain('docker');
+    });
+  });
+
+  describe('GitHub specific context', () => {
+    let mockGitHubClient;
+    let mockTransport;
+
+    beforeEach(() => {
+      mockGitHubClient = {
+        request: jest.fn(),
+        close: jest.fn()
+      };
+      mockTransport = {
+        close: jest.fn()
+      };
+
+      mcpUtils.createConnectedGitHubClient.mockResolvedValue({
+        client: mockGitHubClient,
+        transport: mockTransport
+      });
+    });
+
+    const mockGitHubPR = {
+      platform: 'github',
+      id: '42',
+      repository: 'owner/repo',
+      title: 'GitHub PR',
+      source_branch: 'feature',
+      target_branch: 'main',
+      _raw: {
+        head: { sha: 'abc123' },
+        base: { sha: 'def456' }
+      }
+    };
+
+    const mockGitHubConfig = {
+      platforms: {
+        github: {
+          enabled: true,
+          token: 'github-token'
+        }
+      },
+      review: {
+        maxFilesPerPR: 50,
+        maxLinesPerFile: 1000
+      }
+    };
+
+    it('should build GitHub context with PR files and diffs', async () => {
+      // Mock PR details
+      mockGitHubClient.request
+        .mockResolvedValueOnce({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              head: { sha: 'abc123' },
+              base: { sha: 'def456' }
+            })
+          }]
+        })
+        // Mock changed files
+        .mockResolvedValueOnce({
+          content: [{
+            type: 'text',
+            text: JSON.stringify([
+              {
+                filename: 'src/app.js',
+                status: 'modified',
+                additions: 5,
+                deletions: 3,
+                changes: 8,
+                patch: '@@ -1,3 +1,5 @@\n-old line\n+new line\n+another new line'
+              }
+            ])
+          }]
+        })
+        // Mock file content
+        .mockResolvedValueOnce({
+          content: [{
+            type: 'text',
+            text: 'file content here'
+          }]
+        });
+
+      const prContext = await context.buildContext(mockGitHubPR, mockGitHubConfig);
+
+      expect(prContext).toMatchObject({
+        pr: expect.objectContaining({
+          platform: 'github',
+          owner: 'owner',
+          repo: 'repo',
+          number: 42
+        }),
+        diff: expect.arrayContaining([
+          expect.objectContaining({
+            new_path: 'src/app.js',
+            additions: 5,
+            deletions: 3
+          })
+        ]),
+        files: expect.any(Array),
+        stats: expect.objectContaining({
+          filesChanged: 1,
+          additions: 5,
+          deletions: 3
+        })
+      });
+
+      // Verify correct MCP tools were called
+      expect(mockGitHubClient.request).toHaveBeenCalledWith({
+        method: 'tools/call',
+        params: {
+          name: 'get_pull_request',
+          arguments: {
+            owner: 'owner',
+            repo: 'repo',
+            pull_number: 42
+          }
+        }
+      });
+
+      expect(mockGitHubClient.request).toHaveBeenCalledWith({
+        method: 'tools/call',
+        params: {
+          name: 'get_pull_request_files',
+          arguments: {
+            owner: 'owner',
+            repo: 'repo',
+            pull_number: 42
+          }
+        }
+      });
+    });
+
+    it('should handle GitHub file status types correctly', async () => {
+      mockGitHubClient.request
+        .mockResolvedValueOnce({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({})
+          }]
+        })
+        .mockResolvedValueOnce({
+          content: [{
+            type: 'text',
+            text: JSON.stringify([
+              {
+                filename: 'new.js',
+                status: 'added',
+                patch: '+new file'
+              },
+              {
+                filename: 'deleted.js',
+                status: 'removed',
+                patch: '-old file'
+              },
+              {
+                filename: 'renamed.js',
+                previous_filename: 'old.js',
+                status: 'renamed',
+                patch: 'rename diff'
+              }
+            ])
+          }]
+        });
+
+      const prContext = await context.buildContext(mockGitHubPR, mockGitHubConfig);
+
+      expect(prContext.diff).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          new_path: 'new.js',
+          new_file: true,
+          deleted_file: false
+        }),
+        expect.objectContaining({
+          new_path: 'deleted.js',
+          deleted_file: true,
+          new_file: false
+        }),
+        expect.objectContaining({
+          new_path: 'renamed.js',
+          old_path: 'old.js',
+          renamed_file: true
+        })
+      ]));
+    });
+
+    it('should close GitHub transport properly', async () => {
+      mockGitHubClient.request.mockResolvedValue({
+        content: [{
+          type: 'text',
+          text: JSON.stringify([])
+        }]
+      });
+
+      await context.buildContext(mockGitHubPR, mockGitHubConfig);
+
+      expect(mcpUtils.safeCloseClient).toHaveBeenCalledWith(mockGitHubClient, 'GitHub context building');
+      expect(mockTransport.close).toHaveBeenCalled();
+    });
+
+    it('should handle GitHub API errors gracefully', async () => {
+      mockGitHubClient.request.mockRejectedValue(new Error('GitHub API error'));
+
+      const prContext = await context.buildContext(mockGitHubPR, mockGitHubConfig);
+
+      expect(prContext).toMatchObject({
+        pr: mockGitHubPR,
+        error: expect.stringContaining('Failed to get GitHub PR context')
+      });
     });
   });
 });

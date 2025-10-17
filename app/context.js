@@ -1,5 +1,6 @@
 import {
   createConnectedGitLabClient,
+  createConnectedGitHubClient,
   safeCloseClient,
   parseMCPResponse
 } from './mcp-utils.js';
@@ -123,7 +124,7 @@ class Context {
         async () => client.callTool({
           name: 'get_merge_request_diffs',
           arguments: {
-            project_id: pr.project_id,
+            project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
             merge_request_iid: pr.iid || pr.id
           }
         }),
@@ -138,6 +139,17 @@ class Context {
       );
 
       const diff = parseMCPResponse(diffResponse);
+
+      // Check if diff response is an error
+      if (diff?.error) {
+        throw new Error(`Failed to get GitLab MR diff: ${diff.error}`);
+      }
+
+      // Ensure diff is an array before processing
+      if (!Array.isArray(diff)) {
+        console.error('GitLab diff response is not an array:', diff);
+        throw new Error('Invalid GitLab diff response format');
+      }
 
       // Apply limits
       const limitedDiff = this.applyLimits(diff, config.review);
@@ -166,17 +178,240 @@ class Context {
   }
 
   /**
-   * Build GitHub PR context (stub)
+   * Build GitHub PR context via MCP
    * @param {Object} pr - Pull request object
    * @param {Object} config - Configuration
    * @param {Object} baseContext - Base context object
    * @returns {Promise<Object>} GitHub PR context
    */
   async buildGitHubContext(pr, config, baseContext) {
-    return {
-      ...baseContext,
-      error: 'GitHub context building not implemented'
-    };
+    const platformConfig = config.platforms.github;
+    if (!platformConfig?.token) {
+      return {
+        ...baseContext,
+        error: 'GitHub token must be configured'
+      };
+    }
+
+    // Validate repository format for GitHub
+    if (!isNonEmptyString(pr.repository)) {
+      return {
+        ...baseContext,
+        error: 'GitHub PR must have a valid repository'
+      };
+    }
+
+    // Parse owner/repo from repository string
+    const [owner, repo] = pr.repository.split('/');
+    if (!owner || !repo) {
+      return {
+        ...baseContext,
+        error: `Invalid GitHub repository format: ${pr.repository} (expected owner/repo)`
+      };
+    }
+
+    let client, transport;
+
+    try {
+      // Create MCP client using shared utility for consistency
+      const connection = await createConnectedGitHubClient({
+        token: platformConfig.token,
+        repositories: platformConfig.repositories || []
+      });
+      client = connection.client;
+      transport = connection.transport;
+
+      console.log(`  DEBUG - Calling get_pull_request with: owner="${owner}", repo="${repo}", pullNumber=${parseInt(pr.id)}`);
+
+      // Get PR details first to ensure we have all necessary data
+      const prDetailsResponse = await retryWithBackoff(
+        async () => client.callTool({
+          name: 'get_pull_request',
+          arguments: {
+            owner,
+            repo,
+            pullNumber: parseInt(pr.id)
+          }
+        }),
+        {
+          maxRetries: 3,
+          initialDelay: 1000,
+          shouldRetry: isRetryableError,
+          onRetry: (error, attempt, delay) => {
+            console.log(`  Retrying GitHub PR details request (attempt ${attempt}/3) after ${delay}ms: ${error.message}`);
+          }
+        }
+      );
+
+      console.log('  DEBUG - get_pull_request response content:', JSON.stringify(prDetailsResponse?.content?.[0], null, 2));
+      const prDetails = parseMCPResponse(prDetailsResponse);
+
+      // Check if PR details response is an error
+      if (prDetails?.error) {
+        throw new Error(`Failed to get GitHub PR details: ${prDetails.error}`);
+      }
+
+      // Get changed files for the PR
+      const filesResponse = await retryWithBackoff(
+        async () => client.callTool({
+          name: 'get_pull_request_files',
+          arguments: {
+            owner,
+            repo,
+            pullNumber: parseInt(pr.id)
+          }
+        }),
+        {
+          maxRetries: 3,
+          initialDelay: 1000,
+          shouldRetry: isRetryableError,
+          onRetry: (error, attempt, delay) => {
+            console.log(`  Retrying GitHub files request (attempt ${attempt}/3) after ${delay}ms: ${error.message}`);
+          }
+        }
+      );
+
+      console.log('  DEBUG - get_pull_request_files response content:', JSON.stringify(filesResponse?.content?.[0], null, 2));
+      const changedFiles = parseMCPResponse(filesResponse);
+
+      // Check if changed files response is an error
+      if (changedFiles?.error) {
+        throw new Error(`Failed to get GitHub PR files: ${changedFiles.error}`);
+      }
+
+      // Ensure changedFiles is an array before mapping
+      if (!Array.isArray(changedFiles)) {
+        console.error('GitHub files response is not an array:', changedFiles);
+        throw new Error('Invalid GitHub files response format');
+      }
+
+      // Transform GitHub files to our diff format
+      const diff = changedFiles.map(file => ({
+        old_path: file.previous_filename || file.filename,
+        new_path: file.filename,
+        diff: file.patch || '',
+        new_file: file.status === 'added',
+        deleted_file: file.status === 'removed',
+        renamed_file: file.status === 'renamed',
+        additions: file.additions || 0,
+        deletions: file.deletions || 0,
+        changes: file.changes || 0
+      }));
+
+      // Apply limits
+      const limitedDiff = this.applyLimits(diff, config.review);
+
+      // Calculate statistics
+      const stats = this.calculateStats(limitedDiff);
+
+      // Get file contents for important files (new or modified files)
+      const files = await this.getGitHubFileContents(
+        client,
+        owner,
+        repo,
+        pr,
+        limitedDiff,
+        config
+      );
+
+      // Store PR metadata for output phase
+      return {
+        pr: {
+          ...pr,
+          // Add GitHub-specific metadata needed for posting reviews
+          owner,
+          repo,
+          number: parseInt(pr.id),
+          head_sha: prDetails.head?.sha || pr._raw?.head?.sha,
+          base_sha: prDetails.base?.sha || pr._raw?.base?.sha
+        },
+        diff: limitedDiff,
+        files,
+        stats
+      };
+
+    } catch (error) {
+      const mcpError = new MCPError('GitHub context building failed', 'github', error);
+      console.error('GitHub context error:', mcpError.getFullMessage());
+      return {
+        ...baseContext,
+        error: `Failed to get GitHub PR context: ${error.message}`
+      };
+    } finally {
+      await safeCloseClient(client, 'GitHub context building');
+      // Close transport if it exists
+      if (transport) {
+        try {
+          await transport.close();
+        } catch (e) {
+          console.warn('Failed to close GitHub transport:', e.message);
+        }
+      }
+    }
+  }
+
+  /**
+   * Get file contents from GitHub for analysis
+   * @param {Client} client - MCP client
+   * @param {string} owner - Repository owner
+   * @param {string} repo - Repository name
+   * @param {Object} pr - Pull request object
+   * @param {Array} diff - Diff array
+   * @param {Object} config - Configuration
+   * @returns {Promise<Array>} Array of file contents
+   */
+  async getGitHubFileContents(client, owner, repo, pr, diff, config) {
+    const files = [];
+    const importantFiles = diff.filter(file => {
+      // Skip deleted files
+      if (file.deleted_file) return false;
+
+      // Check for important file patterns
+      const path = file.new_path || file.old_path;
+      const isConfig = /\.(json|yaml|yml|toml|ini)$/i.test(path);
+      const isCode = /\.(js|ts|py|rb|java|go|rs|cpp|c|h|cs)$/i.test(path);
+      const isTest = /test|spec/i.test(path);
+
+      return isConfig || isCode || isTest;
+    }).slice(0, config.review.maxFilesPerPR || 10); // Limit files to analyze
+
+    for (const file of importantFiles) {
+      try {
+        const response = await retryWithBackoff(
+          async () => client.callTool({
+            name: 'get_file_contents',
+            arguments: {
+              owner,
+              repo,
+              path: file.new_path,
+              ref: pr.source_branch || pr._raw?.head?.ref
+            }
+          }),
+          {
+            maxRetries: 2,
+            initialDelay: 500,
+            shouldRetry: isRetryableError
+          }
+        );
+
+        const content = parseMCPResponse(response);
+
+        // Skip if content is an error
+        if (content?.error) {
+          console.warn(`Failed to parse content for ${file.new_path}: ${content.error}`);
+        } else if (content) {
+          files.push({
+            path: file.new_path,
+            content: typeof content === 'string' ? content : content.content || '',
+            encoding: content.encoding || 'utf8'
+          });
+        }
+      } catch (error) {
+        console.warn(`Failed to get content for ${file.new_path}: ${error.message}`);
+      }
+    }
+
+    return files;
   }
 
   /**
@@ -269,6 +504,7 @@ class Context {
   async getFileContents(client, pr, diff, config) {
     const files = [];
     const importantFiles = ['package.json', 'Dockerfile', '.env', 'config.json'];
+    const platformConfig = config.platforms?.[pr.platform] || {};
 
     for (const file of diff) {
       const fileName = file.new_path || file.old_path;
@@ -290,7 +526,7 @@ class Context {
             async () => client.callTool({
               name: 'get_file_contents',
               arguments: {
-                project_id: pr.project_id,
+                project_id: pr.project_path || platformConfig.projectId || pr.project_id,  // Use path format, fallback to pr.project_id
                 file_path: fileName,
                 ref: pr.source_branch
               }
@@ -306,7 +542,11 @@ class Context {
           );
 
           const content = parseMCPResponse(contentResponse);
-          if (content && content.content) {
+
+          // Skip if content is an error
+          if (content?.error) {
+            console.warn(`Failed to parse content for ${fileName}: ${content.error}`);
+          } else if (content && content.content) {
             fileInfo.content = content.content;
           }
         } catch (error) {
@@ -354,4 +594,4 @@ class Context {
   }
 }
 
-export default new Context();
+export default Context;

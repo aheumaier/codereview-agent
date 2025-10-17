@@ -5,20 +5,23 @@
     "excludeLabels": ["wip", "draft", "do-not-review"],
     "maxFilesPerPR": 50,
     "maxLinesPerFile": 1000,
-    "contextLines": 10,
     "minCoveragePercent": 80,
-    "maxComplexity": 10
+    "parallelReviews": {
+      "enabled": true,
+      "temperatures": [0, 0.3]
+    }
   },
   "platforms": {
     "gitlab": {
-      "enabled": true,
+      "enabled": false,
       "url": "${GITLAB_API_URL}",
       "token": "${GITLAB_PERSONAL_ACCESS_TOKEN}",
       "projectId": "${GITLAB_PROJECT_ID}"
     },
     "github": {
-      "enabled": false,
-      "token": "${GITHUB_TOKEN}"
+      "enabled": true,
+      "token": "${GITHUB_PERSONAL_ACCESS_TOKEN}",
+      "repositories": ["aheumaier/codereview-agent"]
     },
     "bitbucket": {
       "enabled": false,
@@ -29,8 +32,20 @@
   "claude": {
     "apiKey": "${CLAUDE_API_KEY}",
     "model": "claude-sonnet-4-5-20250929",
+    "tier": 1,
     "maxTokens": 8192,
-    "temperature": 0
+    "temperature": 0,
+    "rateLimiting": {
+      "enabled": true,
+      "clientSideThrottling": true,
+      "perPRBudget": 100000,
+      "retry": {
+        "maxRetries": 5,
+        "baseDelay": 1000,
+        "maxDelay": 60000,
+        "jitterPercent": 0.1
+      }
+    }
   },
   "output": {
     "dryRun": "${DRY_RUN}",
@@ -41,5 +56,9 @@
   "tracking": {
     "dbPath": "./data/reviews.db",
     "ttlDays": 30
+  },
+  "features": {
+    "useStateManagement": true,
+    "useSubAgents": true
   }
 }

@@ -1,8 +1,10 @@
 import { jest } from '@jest/globals';
+import Discovery from '../../app/discovery.js';
 
 // Mock MCP utils module
 jest.mock('../../app/mcp-utils.js', () => ({
   createConnectedGitLabClient: jest.fn(),
+  createConnectedGitHubClient: jest.fn(),
   safeCloseClient: jest.fn(),
   parseMCPResponse: jest.fn()
 }));
@@ -13,7 +15,6 @@ describe('Discovery Module', () => {
   let mcpUtils;
 
   beforeEach(async () => {
-    jest.resetModules();
     jest.clearAllMocks();
 
     // Get the mocked utils
@@ -31,8 +32,8 @@ describe('Discovery Module', () => {
       return typeof text === 'string' ? JSON.parse(text) : text;
     });
 
-    const discoveryModule = await import('../../app/discovery.js');
-    discovery = discoveryModule.default;
+    // Create fresh instance
+    discovery = new Discovery();
   });
 
   afterEach(() => {
@@ -45,7 +46,8 @@ describe('Discovery Module', () => {
         gitlab: {
           enabled: true,
           token: 'test-token',
-          url: 'https://gitlab.com/api/v4'
+          url: 'https://gitlab.com/api/v4',
+          projectId: 'test/project'
         },
         github: {
           enabled: false
@@ -252,12 +254,155 @@ describe('Discovery Module', () => {
     });
   });
 
-  describe('GitHub stub', () => {
-    it('should return empty array for GitHub (stub)', async () => {
+  describe('GitHub specific discovery', () => {
+    let mockGitHubClient;
+    let mockTransport;
+
+    beforeEach(() => {
+      mockGitHubClient = {
+        request: jest.fn(),
+        close: jest.fn()
+      };
+      mockTransport = {
+        close: jest.fn()
+      };
+
+      mcpUtils.createConnectedGitHubClient.mockResolvedValue({
+        client: mockGitHubClient,
+        transport: mockTransport
+      });
+    });
+
+    it('should discover GitHub PRs with configured repositories', async () => {
       const config = {
         platforms: {
           gitlab: { enabled: false },
-          github: { enabled: true },
+          github: {
+            enabled: true,
+            token: 'github-token',
+            repositories: ['owner/repo1', 'owner/repo2']
+          },
+          bitbucket: { enabled: false }
+        },
+        review: {
+          maxDaysBack: 7,
+          prStates: ['open'],
+          excludeLabels: ['wip', 'draft']
+        }
+      };
+
+      const mockPRs = [
+        {
+          number: 42,
+          title: 'GitHub PR',
+          state: 'open',
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+          user: { login: 'author' },
+          head: { ref: 'feature' },
+          base: { ref: 'main' },
+          labels: []
+        }
+      ];
+
+      mockGitHubClient.request.mockResolvedValue({
+        content: [{
+          type: 'text',
+          text: JSON.stringify(mockPRs)
+        }]
+      });
+
+      const prs = await discovery.discoverPRs(config);
+
+      expect(prs).toHaveLength(2); // Called for 2 repos
+      expect(prs[0]).toMatchObject({
+        platform: 'github',
+        id: '42',
+        title: 'GitHub PR',
+        repository: 'owner/repo1'
+      });
+
+      expect(mockGitHubClient.request).toHaveBeenCalledWith({
+        method: 'tools/call',
+        params: {
+          name: 'list_pull_requests',
+          arguments: expect.objectContaining({
+            owner: 'owner',
+            repo: 'repo1',
+            state: 'open'
+          })
+        }
+      });
+    });
+
+    it('should filter GitHub PRs by labels and draft status', async () => {
+      const config = {
+        platforms: {
+          gitlab: { enabled: false },
+          github: {
+            enabled: true,
+            token: 'github-token',
+            repositories: ['owner/repo']
+          },
+          bitbucket: { enabled: false }
+        },
+        review: {
+          maxDaysBack: 7,
+          prStates: ['open'],
+          excludeLabels: ['wip', 'draft']
+        }
+      };
+
+      const mockPRs = [
+        {
+          number: 1,
+          title: 'Draft PR',
+          draft: true,
+          created_at: new Date().toISOString(),
+          labels: []
+        },
+        {
+          number: 2,
+          title: 'WIP PR',
+          draft: false,
+          created_at: new Date().toISOString(),
+          labels: [{ name: 'wip' }]
+        },
+        {
+          number: 3,
+          title: 'Valid PR',
+          draft: false,
+          created_at: new Date().toISOString(),
+          labels: [{ name: 'feature' }]
+        }
+      ];
+
+      mockGitHubClient.request.mockResolvedValue({
+        content: [{
+          type: 'text',
+          text: JSON.stringify(mockPRs)
+        }]
+      });
+
+      const prs = await discovery.discoverPRs(config);
+
+      expect(prs).toHaveLength(1);
+      expect(prs[0]).toMatchObject({
+        platform: 'github',
+        id: '3',
+        title: 'Valid PR'
+      });
+    });
+
+    it('should handle GitHub API errors gracefully', async () => {
+      const config = {
+        platforms: {
+          gitlab: { enabled: false },
+          github: {
+            enabled: true,
+            token: 'github-token',
+            repositories: ['owner/repo']
+          },
           bitbucket: { enabled: false }
         },
         review: {
@@ -266,9 +411,43 @@ describe('Discovery Module', () => {
         }
       };
 
+      mockGitHubClient.request.mockRejectedValue(new Error('API rate limit'));
+
       const prs = await discovery.discoverPRs(config);
 
       expect(prs).toEqual([]);
+      expect(mcpUtils.safeCloseClient).toHaveBeenCalled();
+      expect(mockTransport.close).toHaveBeenCalled();
+    });
+
+    it('should close GitHub transport properly', async () => {
+      const config = {
+        platforms: {
+          gitlab: { enabled: false },
+          github: {
+            enabled: true,
+            token: 'github-token',
+            repositories: []
+          },
+          bitbucket: { enabled: false }
+        },
+        review: {
+          maxDaysBack: 7,
+          prStates: ['open']
+        }
+      };
+
+      mockGitHubClient.request.mockResolvedValue({
+        content: [{
+          type: 'text',
+          text: JSON.stringify([])
+        }]
+      });
+
+      await discovery.discoverPRs(config);
+
+      expect(mcpUtils.safeCloseClient).toHaveBeenCalledWith(mockGitHubClient, 'GitHub discovery');
+      expect(mockTransport.close).toHaveBeenCalled();
     });
   });
 

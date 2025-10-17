@@ -39,7 +39,7 @@ class Review {
   }
 
   /**
-   * Review a PR using Claude
+   * Review a PR using Claude with sub-agent orchestration
    * @param {Object} context - PR context from context builder
    * @param {Object} config - Configuration
    * @returns {Promise<Object>} Review results
@@ -48,39 +48,9 @@ class Review {
     try {
       this.initializeClient(config.claude.apiKey);
 
+      // Single review - sub-agent orchestration handles the analysis
       const prompt = this.buildReviewPrompt(context, config);
-
-      const response = await retryWithBackoff(
-        async () => this.anthropic.messages.create({
-          model: config.claude.model,
-          max_tokens: config.claude.maxTokens,
-          temperature: config.claude.temperature || 0.3,
-          messages: [
-            {
-              role: 'user',
-              content: prompt
-            }
-          ]
-        }),
-        {
-          maxRetries: 3,
-          initialDelay: 2000, // Longer initial delay for LLM APIs
-          shouldRetry: (error) => {
-            // Check for rate limiting or overloaded responses
-            if (error.status === 429 || error.status === 529) {
-              return true;
-            }
-            // Use default retry logic for other errors
-            return isRetryableError(error);
-          },
-          onRetry: (error, attempt, delay) => {
-            console.log(`  Retrying Claude API call (attempt ${attempt}/3) after ${delay}ms: ${error.message || error.status}`);
-          }
-        }
-      );
-
-      const reviewText = response.content[0].text;
-      return this.parseReviewResponse(reviewText);
+      return await this.runSingleReview(prompt, config);
 
     } catch (error) {
       const wrappedError = wrapError(error, 'Review failed');
@@ -93,6 +63,50 @@ class Review {
       };
     }
   }
+
+  /**
+   * Run a single review
+   * @param {string} prompt - Review prompt
+   * @param {Object} config - Configuration
+   * @returns {Promise<Object>} Review result
+   */
+  async runSingleReview(prompt, config) {
+    console.log(`  Running review analysis...`);
+
+    try {
+      const response = await retryWithBackoff(
+        async () => this.anthropic.messages.create({
+          model: config.claude.model,
+          max_tokens: config.claude.maxTokens,
+          temperature: config.claude.temperature || 0,
+          messages: [
+            {
+              role: 'user',
+              content: prompt
+            }
+          ]
+        }),
+        {
+          maxRetries: 3,
+          initialDelay: 2000,
+          shouldRetry: isRetryableError,
+          onRetry: (error, attempt, delay) => {
+            console.log(`  Retrying review (attempt ${attempt}/3) after ${delay}ms: ${error.message || error.status}`);
+          }
+        }
+      );
+
+      const reviewText = response.content[0].text;
+      const review = this.parseReviewResponse(reviewText);
+
+      return review;
+
+    } catch (error) {
+      console.error(`  Review error: ${error.message}`);
+      throw error;
+    }
+  }
+
 
   /**
    * Build review prompt for Claude
@@ -240,4 +254,4 @@ Statistics:
   }
 }
 
-export default new Review();
+export default Review;
