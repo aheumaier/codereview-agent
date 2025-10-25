@@ -28,6 +28,31 @@ This document describes the recommended workflow for developing features in this
 - ✅ **Clean git history** - One feature per branch, clear commit messages
 - ✅ **Code review ready** - Well-documented changes with context
 
+### Automated Workflow with Slash Commands
+
+This workflow can be **fully automated** using custom slash commands:
+
+- `/new-feature` - Start new feature with branch and requirements
+- `/review-requirements` - Validate requirements document
+- `/plan` - Create implementation plan (doesn't implement code)
+- `/implement` - Execute plan phase by phase
+- `/commit` - Create conventional commit
+- `/pr` - Create pull request
+- `/workflow-status` - Check progress and next steps
+
+**See**: `.claude/commands/README.md` for complete command documentation
+
+**Quick Start**:
+```bash
+/new-feature          # Creates branch + requirements template
+# → Fill in requirements
+/review-requirements  # Get feedback
+/plan                 # Create implementation plan
+/implement            # Build feature incrementally
+/commit               # Commit with proper format
+/pr                   # Create PR
+```
+
 ---
 
 ## Workflow Phases
