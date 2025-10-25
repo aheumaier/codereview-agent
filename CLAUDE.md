@@ -571,3 +571,72 @@ python3 scripts/dotnet-namespace-churn.py --period "1 month" --threshold 1
 12. **Validator Agent Confidence**: Don't blindly trust confidence scores - validator may adjust based on multiple agent consensus
 13. **Churn Analysis Path**: Run churn scripts from repository root, not from scripts directory
 14. **Budget Exceeded Errors**: Catch `TokenBudgetExceededError` separately from generic errors for graceful degradation
+
+## Development Workflow with Claude Code
+
+This project follows a structured development workflow optimized for AI-assisted development. For comprehensive guidance on working with Claude Code:
+
+**See**: `docs/development-workflow-with-claude.md`
+
+**Quick Summary**:
+1. Create feature branch from main
+2. Draft requirements using `docs/requirements/TEMPLATE.md`
+3. Activate plan mode and review implementation plan
+4. Implement incrementally with frequent testing
+5. Commit with conventional commit format
+6. Create detailed PR with context
+
+**Plan Mode Pattern**:
+```
+I want to work in plan mode.
+
+Please read: docs/requirements/my-feature.md
+
+Then:
+1. Analyze the requirements
+2. Create a detailed implementation plan
+3. Show me the plan for review
+4. Wait for my approval before implementing
+
+Do NOT make any code changes yet.
+```
+
+**Requirements Template**:
+- Use `docs/requirements/TEMPLATE.md` for all new features
+- Template includes 17 sections optimized for AI agent parsing
+- MoSCoW prioritization (Must/Should/Could/Won't Have)
+- AI agent instructions section for plan mode workflow
+- Acceptance criteria checkboxes for progress tracking
+
+**When to Use Plan Mode**:
+- Complex features touching 3+ files or 100+ lines
+- Any architectural changes
+- New platform integrations
+- Performance optimizations
+
+**Commit Message Format** (Conventional Commits):
+```
+<type>(<scope>): <subject>
+
+<body>
+
+<footer>
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+```
+
+Types: feat, fix, refactor, docs, test, chore, perf
+
+## Architecture Documentation
+
+**Current Architecture**:
+- `docs/review-agent-architecture.md` - Process flow and state management
+- `docs/platform-dynamic-selection-architecture.md` - Proposed dynamic platform selection (not yet implemented)
+
+**When Adding New Features**:
+1. Check if architecture documentation exists
+2. Review constraints and design patterns
+3. Follow established patterns (Strategy, Registry, Circuit Breaker)
+4. Update architecture docs after implementation
